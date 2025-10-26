@@ -1,0 +1,8 @@
+[Unit]
+Description=Watch WirePlumber default nodes for unwanted source changes
+
+[Path]
+PathChanged=%h/.local/state/wireplumber/default-nodes
+
+[Install]
+WantedBy=default.target

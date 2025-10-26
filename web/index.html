@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="eo">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Esperanto Live Captions</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header id="header">
+        <div class="branding">
+          <span class="title">Esperanto Live Captions</span>
+          <span class="subtitle">Esperanto → 日本語 / 한국어</span>
+        </div>
+        <div id="controls">
+          <div class="control-group">
+            <label class="toggle">
+              <input type="checkbox" id="showPartial" checked />
+              <span>Partial（途中経過）</span>
+            </label>
+            <label class="toggle">
+              <span>文字サイズ</span>
+              <input type="range" id="fontSize" min="28" max="96" value="52" />
+            </label>
+            <label class="toggle">
+              <input type="checkbox" id="darkMode" checked />
+              <span>ダークテーマ</span>
+            </label>
+          </div>
+          <div class="control-group">
+            <button id="copyHistory" type="button">履歴をコピー</button>
+            <button id="downloadHistory" type="button">履歴を保存</button>
+            <button id="clearHistory" type="button">履歴をクリア</button>
+          </div>
+          <div class="control-group translation-group">
+            <span class="control-label">翻訳表示</span>
+            <div id="translationControls" class="translation-controls"></div>
+          </div>
+        </div>
+        <div id="helpPanel">
+          <p>操作ガイド</p>
+          <ul>
+            <li>翻訳トグルで言語ごとの表示／非表示を切り替え（設定はブラウザに保存されます）。</li>
+            <li>途中経過を見たい場合は「Partial」をオン、文字サイズとテーマも自由に調整できます。</li>
+            <li>履歴は右側パネルに蓄積され、コピー／保存／クリアの各ボタンで共有やリセットが可能です。</li>
+          </ul>
+        </div>
+      </header>
+      <main id="content">
+        <section id="livePanel">
+          <div id="finalCard">
+            <div id="final" class="headline"></div>
+            <div id="translations"></div>
+          </div>
+          <div id="partial" class="partial faint"></div>
+        </section>
+        <aside id="historyPanel">
+          <div class="history-header">
+            <h2>履歴</h2>
+            <small>最新発話が上に表示されます</small>
+          </div>
+          <div id="history"></div>
+        </aside>
+      </main>
+    </div>
+    <script src="/static/client.js"></script>
+  </body>
+  </html>
