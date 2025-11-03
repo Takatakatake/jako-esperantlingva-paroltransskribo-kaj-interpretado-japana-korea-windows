@@ -53,7 +53,7 @@ async def translate_text(text: str) -> None:
 
     print(f"Source ({cfg.source_language}): {result.text}")
     for lang, translated in result.translations.items():
-        print(f"→ {lang}: {translated}")
+        print(f"-> {lang}: {translated}")
 
 
 def parse_args(argv: Iterable[str]) -> argparse.Namespace:

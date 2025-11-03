@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-import logging
-import re
-import webbrowser
 import functools
+import logging
+import os
+import re
+import sys
+import webbrowser
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -207,6 +209,7 @@ class TranscriptionPipeline:
         self._running = True
         logging.info("Starting transcription pipeline with backend=%s.", self.backend_choice.value)
 
+
         backend = self._create_backend()
         try:
             with self._transcript_logger:
@@ -231,8 +234,17 @@ class TranscriptionPipeline:
                         else:
                             if self.settings.web.open_browser:
                                 url = f"http://{self.settings.web.host}:{self._web_ui.port}"
-                                loop = asyncio.get_running_loop()
-                                await loop.run_in_executor(None, functools.partial(webbrowser.open, url))
+                                logging.info("Opening caption board in default browser: %s", url)
+                                try:
+                                    if sys.platform.startswith("win"):
+                                        os.startfile(url)  # type: ignore[attr-defined]
+                                    else:
+                                        loop = asyncio.get_running_loop()
+                                        await loop.run_in_executor(
+                                            None, functools.partial(webbrowser.open, url, new=1)
+                                        )
+                                except Exception as exc:  # noqa: BLE001
+                                    logging.warning("Failed to open browser automatically: %s", exc)
                     async with self._audio_stream.connect() as audio_stream:
                         async with backend:
                             await self._main_loop(audio_stream, backend)
