@@ -1,0 +1,23 @@
+PC出力を静かに文字起こしできた理由（設定分析まとめ）
+
+ループバック経路の確立
+
+Windows の既定再生デバイスは物理ヘッドホン (2- Realtek(R) Audio)、既定録音デバイスはウェブカメラマイクに保ったまま、アプリ単位（Chrome）で出力を CABLE Input、入力を CABLE Output に固定した。
+mmsys.cpl → 録音タブで CABLE Output に「このデバイスを聴く」を有効化し、再生先を既定の再生デバイス（イヤホン）に設定。これにより、YouTube → VB-Cable → アプリ → イヤホン の両立が可能になった。
+サンプルレート／チャネルの統一
+
+.env を含む全設定で 16 kHz・モノラル (AUDIO_DEVICE_SAMPLE_RATE=16000, AUDIO_SAMPLE_RATE=16000, AUDIO_CHANNELS=1) に統一。
+Windows 側でも CABLE Input/CABLE Output のプロパティを「16-bit, 16 000 Hz」に揃えたため、ドライバでの自動変換がなくなり、レベル揺らぎや歪みが解消されて精度が大幅に向上した。
+デバイス指定の固定
+
+python -m transcriber.cli --list-devices の結果から WASAPI インデックス (#24) を選び .env の AUDIO_DEVICE_INDEX=24 としたことで、Bluetooth などの抜き差しで番号がずれても影響を受けなくなった。
+Windows 側では CABLE Output を「既定の通信デバイス」、CABLE Input を「準備完了」に留めることで、ほかのアプリが勝手に VB-Cable を掴むことを防いだ。
+音量・経路の可視化
+
+音量ミキサーで Chrome の出力＝CABLE Input、入力＝CABLE Output を常時監視。録音タブのメーターや「このデバイスを聴く」で耳からモニターすることで、実際にループバックへ信号が届いているかリアルタイムで確認できた。
+全体構成の整合
+
+.env の AUDIO_WINDOWS_LOOPBACK_DEVICE=CABLE Output (VB-Audio Virtual Cable) と Windows 側のデバイス名称を一致させ、easy_start 診断でも「設定済みデバイス: #24 CABLE Output」が表示される状態を維持。
+VB-Cable ドライバ（3.3.1.7）を最新に保ち、出力・入力とも 100% 付近のボリュームにすることで、Speechmatics へ十分な振幅を送れた。
+結果
+これらの設定により、ループバック経路・サンプルレート・音量が全て一致し、イヤホンで静かにモニタリングしながら高精度な文字起こしが達成できた。特に 16 kHz への統一と「このデバイスを聴く」による信号確認が精度改善の決定打となった。
