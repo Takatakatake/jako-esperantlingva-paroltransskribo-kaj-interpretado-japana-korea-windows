@@ -14,3 +14,7 @@ logs/
 Thumbs.db
 *.swp
 *.swo
+
+# files
+
+gen-lang-client-*-*.json
