@@ -80,6 +80,7 @@ function Show-Menu {
     Write-Host "11. git remote -v"
     Write-Host "12. git diff"
     Write-Host "13. git stash -> git pull --rebase -> git stash pop"
+    Write-Host "14. enforce LF (Ubuntu) line endings"
     Write-Host "h. Help"
     Write-Host "0. Exit"
 }
@@ -101,6 +102,7 @@ function Show-Help {
     Write-Host "12. git diff          : Show diffs"
     Write-Host "13. git stash -> git pull --rebase -> git stash pop"
     Write-Host "    Temporarily stash changes, rebase pull from origin/main, then pop"
+    Write-Host "14. enforce LF line endings : Set core.autocrlf=false and renormalize"
     Write-Host "h. Help               : Show this help"
     Write-Host "0. Exit               : Quit the script"
     Write-Host "---------------------------------"
@@ -157,6 +159,14 @@ function Invoke-StashPullRebase {
     Invoke-GitCommand -Arguments @("stash", "pop") -Description "git stash pop"
 }
 
+function Invoke-EnforceLFEndings {
+    Write-Host "Setting repository to Ubuntu (LF) line endings..."
+    Invoke-GitCommand -Arguments @("config", "core.autocrlf", "false") -Description "git config core.autocrlf false"
+    Write-Host "Re-normalizing tracked files to LF..."
+    Invoke-GitCommand -Arguments @("add", "--renormalize", ".") -Description "git add --renormalize ."
+    Write-Host "Review 'git status' and commit the normalization if needed." -ForegroundColor Yellow
+}
+
 while ($true) {
     Show-Header
     Show-Menu
@@ -204,6 +214,7 @@ while ($true) {
         "11" { Invoke-GitCommand -Arguments @("remote", "-v") -Description "git remote -v" }
         "12" { Invoke-GitCommand -Arguments @("diff") -Description "git diff" }
         "13" { Invoke-StashPullRebase }
+        "14" { Invoke-EnforceLFEndings }
         "h"  { Show-Help }
         "H"  { Show-Help }
         "0"  {
