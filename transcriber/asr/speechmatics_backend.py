@@ -13,17 +13,43 @@ import aiohttp
 
 import websockets
 from websockets import WebSocketClientProtocol
+from websockets.exceptions import ConnectionClosed
 
 from ..config import SpeechmaticsConfig
-from .base import StreamingTranscriptionBackend, TranscriptSegment
+from .base import StreamingTranscriptionBackend, TranscriptionBackendError, TranscriptSegment
 
 
-class SpeechmaticsRealtimeError(Exception):
+class SpeechmaticsRealtimeError(TranscriptionBackendError):
     """Raised when communication with Speechmatics fails."""
+
+    def __init__(self, message: str, *, retryable: bool = True) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 class SpeechmaticsRealtimeBackend(StreamingTranscriptionBackend):
     """Manage realtime transcription sessions with Speechmatics."""
+
+    _CLOSE_ERROR_HINTS = {
+        4001: ("not_authorised", "API key or temporary key was not accepted.", False),
+        4003: ("not_allowed", "The account is not allowed to use the requested realtime action.", False),
+        4004: (
+            "invalid_model",
+            "The requested language/model/operating_point is not available to this account.",
+            False,
+        ),
+        4005: (
+            "quota_exceeded",
+            "The maximum number of concurrent realtime connections has been reached.",
+            True,
+        ),
+        4006: (
+            "timelimit_exceeded",
+            "The realtime usage time quota for the Speechmatics contract has been reached.",
+            False,
+        ),
+        4013: ("job_error", "Speechmatics could not start the realtime job.", True),
+    }
 
     def __init__(self, config: SpeechmaticsConfig) -> None:
         self.config = config
@@ -73,6 +99,8 @@ class SpeechmaticsRealtimeBackend(StreamingTranscriptionBackend):
                 last_exc = exc
                 logging.error("Speechmatics connection attempt failed: %s", exc)
                 await self.close()
+                if not exc.retryable:
+                    raise
             attempt += 1
 
         raise SpeechmaticsRealtimeError(
@@ -151,13 +179,21 @@ class SpeechmaticsRealtimeBackend(StreamingTranscriptionBackend):
         return "eu"
 
     async def _build_connection_params(self) -> tuple[str, Dict[str, str]]:
-        token = self.config.jwt_token
-        if not token:
-            token = await self._authorize_jwt()
-        if not token:
-            raise SpeechmaticsRealtimeError("Failed to obtain JWT for Speechmatics.")
-        headers = {"Authorization": f"Bearer {token}"}
         ws_url = self._augment_ws_url_with_language(self.config.connection_url, self.config.language)
+        token = (self.config.jwt_token or "").strip()
+        if token:
+            return ws_url, {"Authorization": f"Bearer {token}"}
+
+        api_key = (self.config.api_key or "").strip()
+        if self.config.auth_mode == "api_key":
+            if not api_key:
+                raise SpeechmaticsRealtimeError("SPEECHMATICS_API_KEY is required for Speechmatics.")
+            return ws_url, {"Authorization": f"Bearer {api_key}"}
+
+        token = await self._authorize_jwt()
+        if not token:
+            raise SpeechmaticsRealtimeError("Failed to obtain temporary key for Speechmatics.")
+        headers = {"Authorization": f"Bearer {token}"}
         return ws_url, headers
 
     async def _open_connection(self, ws_url: str, headers: Dict[str, str]) -> None:
@@ -174,7 +210,13 @@ class SpeechmaticsRealtimeBackend(StreamingTranscriptionBackend):
         except Exception as exc:  # pylint: disable=broad-except
             raise SpeechmaticsRealtimeError(f"Failed to connect to Speechmatics: {exc}") from exc
 
-        await self._send_start_message()
+        try:
+            await self._send_start_message()
+        except ConnectionClosed as exc:
+            raise self._connection_closed_error(
+                exc,
+                "Speechmatics closed the connection while starting recognition",
+            ) from exc
         self._connected.set()
         self._listen_task = asyncio.create_task(self._listen_loop(), name="speechmatics-listener")
 
@@ -209,6 +251,11 @@ class SpeechmaticsRealtimeBackend(StreamingTranscriptionBackend):
                 raise SpeechmaticsRealtimeError("Recognition did not start in time.") from exc
         try:
             await self._websocket.send(chunk)
+        except ConnectionClosed as exc:
+            raise self._connection_closed_error(
+                exc,
+                "Speechmatics closed the connection while streaming audio",
+            ) from exc
         except Exception as exc:  # pylint: disable=broad-except
             raise SpeechmaticsRealtimeError(f"Failed to stream audio: {exc}") from exc
 
@@ -240,10 +287,74 @@ class SpeechmaticsRealtimeBackend(StreamingTranscriptionBackend):
                 "sample_rate": self.config.sample_rate,
             },
         }
+        if self.config.operating_point != "standard":
+            start_message["transcription_config"]["operating_point"] = self.config.operating_point
         if diarization_mode:
             start_message["transcription_config"]["diarization"] = diarization_mode
         await self._websocket.send(json.dumps(start_message))
         logging.debug("Sent Speechmatics StartRecognition: %s", start_message)
+
+    @classmethod
+    def _format_close_message(
+        cls,
+        *,
+        context: str,
+        code: Optional[int],
+        reason: Optional[str],
+        operating_point: str,
+    ) -> tuple[str, bool]:
+        label, hint, retryable = cls._CLOSE_ERROR_HINTS.get(
+            code or 0,
+            ("unknown_close", "No specific Speechmatics close-code hint is available.", True),
+        )
+        parts = [f"{context}: {label}"]
+        if code is not None:
+            parts.append(f"close_code={code}")
+        if reason:
+            parts.append(f"reason={reason}")
+        parts.append(hint)
+        if code == 4006:
+            parts.append(
+                "Speechmatics rejected StartRecognition before audio was processed; "
+                "this is not caused by silent input or Linux loopback routing. "
+                "Verify the API key, workspace, realtime entitlement, and contract usage "
+                "in the Speechmatics portal. If the portal shows available realtime quota, "
+                "contact Speechmatics support with close_code=4006 and reason=timelimit_exceeded."
+            )
+        elif code in {4003, 4004} and operating_point == "enhanced":
+            parts.append(
+                "This may mean enhanced is not enabled for the current API key; "
+                "set SPEECHMATICS_OPERATING_POINT=standard to restore the standard model."
+            )
+        return " | ".join(parts), retryable
+
+    def _connection_closed_error(self, exc: ConnectionClosed, context: str) -> SpeechmaticsRealtimeError:
+        received = getattr(exc, "rcvd", None)
+        code = getattr(received, "code", None)
+        reason = getattr(received, "reason", None)
+        message, retryable = self._format_close_message(
+            context=context,
+            code=code,
+            reason=reason,
+            operating_point=self.config.operating_point,
+        )
+        return SpeechmaticsRealtimeError(message, retryable=retryable)
+
+    def _server_error_message(self, payload: Dict) -> SpeechmaticsRealtimeError:
+        error_type = str(payload.get("type") or "unknown_error")
+        reason = str(payload.get("reason") or "").strip()
+        close_code = None
+        for code, (label, _hint, _retryable) in self._CLOSE_ERROR_HINTS.items():
+            if label == error_type:
+                close_code = code
+                break
+        message, retryable = self._format_close_message(
+            context="Speechmatics returned an error",
+            code=close_code,
+            reason=reason or error_type,
+            operating_point=self.config.operating_point,
+        )
+        return SpeechmaticsRealtimeError(message, retryable=retryable)
 
     async def _listen_loop(self) -> None:
         """Receive transcript messages and push them into the queue."""
@@ -266,10 +377,9 @@ class SpeechmaticsRealtimeBackend(StreamingTranscriptionBackend):
                 elif msg_type in ("Warning",):
                     logging.warning("Speechmatics warning: %s", payload)
                 elif msg_type in ("Error", "error"):
-                    logging.error("Speechmatics error: %s", payload)
-                    await self._handle_listener_failure(
-                        SpeechmaticsRealtimeError(f"Speechmatics returned error: {payload}")
-                    )
+                    error = self._server_error_message(payload)
+                    logging.error("Speechmatics error: %s", error)
+                    await self._handle_listener_failure(error)
                     break
                 else:
                     logging.debug("Speechmatics message ignored: %s", payload)
@@ -315,9 +425,12 @@ class SpeechmaticsRealtimeBackend(StreamingTranscriptionBackend):
     async def _handle_listener_failure(self, error: SpeechmaticsRealtimeError) -> None:
         if self._listener_error is None:
             self._listener_error = error
-            if self._websocket and not self._websocket.closed:
+            if self._websocket and getattr(self._websocket, "close_code", None) is None:
                 with contextlib.suppress(Exception):
-                    await self._websocket.close(code=1011, reason=str(error))
+                    await self._websocket.close(
+                        code=1011,
+                        reason="transcription_backend_error",
+                    )
             await self._transcript_queue.put(None)
 
     def _reset_transcript_queue(self) -> None:

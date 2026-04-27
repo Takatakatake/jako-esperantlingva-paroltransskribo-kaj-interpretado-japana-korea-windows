@@ -2,6 +2,42 @@
 
 この文書は、Ubuntu 上で「イヤホンでもスピーカーでも PC 再生音を聞きながら、その同じ音声をリアルタイム文字起こしに送る」という理想的な状態を再現するための手順です。PipeWire/PulseAudio 監視と `.env` 設定、サウンド設定アプリ、付属スクリプトを組み合わせれば、どのマシンでも同一状況を再現できます。
 
+より詳しい再現手順は `Ubuntu音声環境のセットアップ方法.md` を参照してください。このファイルは短い引き継ぎメモとチェックリストとして使います。
+
+## 0. Linux 版ループバックの全体像
+
+Windows 版の VB-CABLE と同じ発想で見ると、Linux 版では PipeWire/PulseAudio の仮想 sink と monitor source を使って、再生音を「文字起こし」と「自分の耳」の二手に分けます。
+
+```text
+Edge / Chrome / Discord など
+  出力先: codex_transcribe 仮想sink
+        |
+        v
+  [PipeWire/PulseAudio module-null-sink]
+        |
+        +--> codex_transcribe.monitor
+        |      |
+        |      +--> このツールが入力として拾う
+        |            -> Speechmatics
+        |            -> Google 翻訳
+        |            -> Web UI / ログ
+        |
+        +--> module-loopback
+               再生先: 元のヘッドホン / スピーカー sink
+               -> 自分の耳で聞く
+```
+
+`codex_transcribe` は `scripts/setup_audio_loopback_linux.sh` が作る仮想出力先です。`codex_transcribe.monitor` が録音側の入力になり、`module-loopback` が同じ音を実際のヘッドホンやスピーカーへ戻します。
+
+| 役割 | Linux での名前 | Windows 版で近いもの |
+| --- | --- | --- |
+| アプリが音を流し込む先 | `codex_transcribe` 仮想 sink | `CABLE Input` |
+| 文字起こしツールが拾う入力 | `codex_transcribe.monitor` / `Monitor of <sink>` | `CABLE Output` |
+| 自分の耳へ戻す経路 | `module-loopback` | 「このデバイスを聴く」 |
+| 実際に聞く先 | 物理ヘッドホン / スピーカー sink | ヘッドホン / スピーカー |
+
+通常の PipeWire 環境では、物理出力にも `Monitor of <sink>` が自動で存在します。そのため、明示的に `codex_transcribe` を作らなくても `pipewire` / `default` / `*.monitor` を入力候補として拾える場合があります。環境によって monitor が不安定な場合だけ、`scripts/setup_audio_loopback_linux.sh` で Windows 版 VB-CABLE に近い明示的な経路を作ります。
+
 ## 1. 事前準備
 
 1. 依存パッケージ
@@ -20,6 +56,8 @@
    TRANSCRIPTION_BACKEND=speechmatics
    SPEECHMATICS_LANGUAGE=eo
    SPEECHMATICS_SAMPLE_RATE=16000
+   SPEECHMATICS_AUTH_MODE=temporary_key
+   SPEECHMATICS_OPERATING_POINT=standard
    AUDIO_CAPTURE_MODE=loopback
    AUDIO_DEVICE_INDEX=4          # `python -m transcriber.cli --list-devices` で得た pipewire の番号
    AUDIO_SAMPLE_RATE=16000       # 内部処理レート
@@ -28,7 +66,9 @@
    AUDIO_CHUNK_DURATION_SECONDS=0.5
    ```
    - 16 kHz で Speechmatics に送る一方、デバイス実レートを 48 kHz に固定しておくとノイズ・ドロップを避けやすい（`docs/audio_loopback.md` と `.env` の既存コメントに沿う）。
-   - `AUDIO_DEVICE_INDEX` は `pipewire` か `default` を指定する。PipeWire 環境では monitor がこの仮想デバイス配下に現れ、イヤホン／スピーカーの切り替えを透過的に扱える。
+   - `AUDIO_DEVICE_INDEX` には、`python -m transcriber.cli --list-devices` で得た `pipewire` / `default` / `*.monitor` の番号を指定する。`.env` に文字列の `pipewire` を直接入れるのではなく、一覧に出た番号を入れる。
+   - `AUDIO_LINUX_LOOPBACK_SINK` を使う場合は、録音元ではなく「戻し先」の物理 sink 名（例: `alsa_output...analog-stereo`）を入れる。録音元はその `.monitor`、または `pipewire` / `default` の入力候補になる。
+   - `SPEECHMATICS_OPERATING_POINT=standard` は `operating_point` を送らず既定モデルに任せる。高精度化する場合だけ `python -m transcriber.cli --set-speechmatics-operating-point enhanced` で切り替え、問題があれば `standard` に戻す。
 
 ## 2. サウンド設定の考え方
 
@@ -42,6 +82,8 @@
 source .venv311/bin/activate
 python -m transcriber.cli --list-devices      # pipewire(default) の index を確認
 python -m transcriber.cli --diagnose-audio    # 設定済みデバイスが pipewire になっているか確認
+python -m transcriber.cli --audio-routing-guide
+python -m transcriber.cli --test-audio-levels 3 --test-audio-profile loopback
 ```
 
 診断レポートの「設定済みデバイス」が `#4 pipewire` など期待値なら準備完了。ループバック候補に `pipewire`/`default` が表示されない場合は PipeWire/PulseAudio サービスの再起動や `pactl info` での確認を行う。
@@ -60,6 +102,7 @@ python -m transcriber.cli --diagnose-audio    # 設定済みデバイスが pipe
 - **既定ソース固定**: どうしても monitor が他の入力に切り替わる環境では、`install -Dm755 scripts/wp-force-monitor.sh ~/bin/wp-force-monitor.sh` を実行し、必要に応じて systemd user サービス化して monitor を常に再設定する。
 - **設定リセット**: トラブル時は `bash scripts/reset_audio_defaults.sh` を実行して物理スピーカー/マイクを選び直し、ループバック用の `module-loopback`/`module-null-sink` をアンロードできる。
 - **ループバック再構築**: もし monitor が作成されない環境（古い PulseAudio 等）では、`scripts/setup_audio_loopback_linux.sh` を使って `codex_transcribe` という null sink + monitor を明示的に生成し、出力先（HEADPHONE_SINK）をイヤホンに指定することで同じ理想状態を再現できる。
+- **Speechmatics 精度切替**: `python -m transcriber.cli --set-speechmatics-operating-point enhanced` で高精度側へ切り替える。契約や利用枠で enhanced が使えない場合は Speechmatics 側のエラーになるため、`--set-speechmatics-operating-point standard` で戻す。切替時は `.env.bak.*` が作られる。
 
 ## 6. 検証チェックリスト
 
@@ -68,6 +111,7 @@ python -m transcriber.cli --diagnose-audio    # 設定済みデバイスが pipe
 3. CLI ログに「no data」警告が出ていない。出た場合は `pavucontrol` で monitor を選び直す。
 4. イヤホンを抜く → スピーカー再生 → イヤホンを再び挿す、の順に切り替えても認識が途切れない。
 5. `logs/meet-session.log` に連続した書き込み（Transcript）が残っている。
+6. 高精度運用にした場合は `.env` の `SPEECHMATICS_OPERATING_POINT=enhanced` を確認し、不安定なら `standard` に戻せることを確認する。
 
 ## 7. トラブル対処早見表
 
@@ -77,6 +121,7 @@ python -m transcriber.cli --diagnose-audio    # 設定済みデバイスが pipe
 | ループバック候補に `pipewire` が出ない | PipeWire/PulseAudio が不安定 | `systemctl --user restart pipewire pipewire-pulse` |
 | ノイズ・ドロップが増えた | サンプリング不一致 | `.env` の `AUDIO_DEVICE_SAMPLE_RATE=48000` を確認、会議アプリ側も 48 kHz に合わせる |
 | 設定が仮想デバイスのまま残る | null-sink をアンロードしていない | `bash scripts/reset_audio_defaults.sh` で戻す |
+| enhanced へ切り替えたら Speechmatics が拒否する | APIキー/契約/利用枠が enhanced realtime に未対応 | `python -m transcriber.cli --set-speechmatics-operating-point standard` で戻し、Speechmatics ポータルで権限と残枠を確認 |
 
 ---
 

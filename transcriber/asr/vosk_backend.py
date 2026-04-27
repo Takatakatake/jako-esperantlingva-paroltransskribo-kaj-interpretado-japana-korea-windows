@@ -10,10 +10,10 @@ from typing import AsyncGenerator, Optional
 from vosk import KaldiRecognizer, Model  # type: ignore
 
 from ..config import VoskConfig
-from .base import StreamingTranscriptionBackend, TranscriptSegment
+from .base import StreamingTranscriptionBackend, TranscriptionBackendError, TranscriptSegment
 
 
-class VoskBackendError(Exception):
+class VoskBackendError(TranscriptionBackendError):
     """Raised when Vosk streaming fails."""
 
 

@@ -2,6 +2,8 @@
 
 このメモは Google Meet のループバック音声を常に PipeWire monitor から取得できるようにするための手順です。
 
+初回セットアップの全体像、`codex_transcribe` 仮想 sink、Speechmatics の `standard` / `enhanced` 切り替えまで含めた手順は、リポジトリ直下の `Ubuntu音声環境のセットアップ方法.md` を参照してください。
+
 ## 1. ループバック入力の確認
 
 ```bash

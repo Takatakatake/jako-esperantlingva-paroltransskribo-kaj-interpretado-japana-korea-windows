@@ -6,7 +6,7 @@ import os
 import logging
 from enum import Enum
 from functools import lru_cache
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Mapping, Optional
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, ValidationError
@@ -99,6 +99,8 @@ class SpeechmaticsConfig(BaseModel):
     api_key: str = Field(..., min_length=10)
     app_id: str = Field(default="realtime", min_length=1)
     language: str = Field(default="eo", min_length=2)
+    auth_mode: Literal["api_key", "temporary_key"] = "temporary_key"
+    operating_point: Literal["standard", "enhanced"] = "standard"
     sample_rate: int = Field(default=16_000, ge=8_000, le=48_000)
     enable_diarization: bool = True
     enable_punctuation: bool = True
@@ -203,6 +205,53 @@ class Settings(BaseModel):
     discord: DiscordConfig = DiscordConfig()
 
 
+def _blank_to_none(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    cleaned = value.strip()
+    return cleaned or None
+
+
+def _optional_int(env: Mapping[str, str], name: str) -> Optional[int]:
+    value = _blank_to_none(env.get(name))
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer, got {value!r}.") from exc
+
+
+def _speechmatics_operating_point(env: Mapping[str, str]) -> str:
+    raw_value = env.get("SPEECHMATICS_OPERATING_POINT", "standard")
+    value = raw_value.strip().lower() or "standard"
+    if value not in {"standard", "enhanced"}:
+        raise RuntimeError(
+            "SPEECHMATICS_OPERATING_POINT must be 'standard' or 'enhanced', "
+            f"got {raw_value!r}."
+        )
+    return value
+
+
+def _speechmatics_auth_mode(env: Mapping[str, str]) -> str:
+    raw_value = env.get("SPEECHMATICS_AUTH_MODE", "temporary_key")
+    value = raw_value.strip().lower() or "temporary_key"
+    aliases = {
+        "api": "api_key",
+        "direct": "api_key",
+        "jwt": "temporary_key",
+        "temporary": "temporary_key",
+        "temp": "temporary_key",
+    }
+    normalized = aliases.get(value, value)
+    if normalized not in {"api_key", "temporary_key"}:
+        raise RuntimeError(
+            "SPEECHMATICS_AUTH_MODE must be 'api_key' or 'temporary_key', "
+            f"got {raw_value!r}."
+        )
+    return normalized
+
+
 @lru_cache(maxsize=1)
 def load_settings() -> Settings:
     """Load settings from environment variables and .env files."""
@@ -219,6 +268,8 @@ def load_settings() -> Settings:
                 api_key=env.get("SPEECHMATICS_API_KEY", env.get("SPEECHMATICS_JWT", "")),
                 app_id=env.get("SPEECHMATICS_APP_ID", "realtime"),
                 language=env.get("SPEECHMATICS_LANGUAGE", "eo"),
+                auth_mode=_speechmatics_auth_mode(env),
+                operating_point=_speechmatics_operating_point(env),
                 sample_rate=int(env.get("SPEECHMATICS_SAMPLE_RATE", "16000")),
                 enable_diarization=env.get("SPEECHMATICS_ENABLE_DIARIZATION", "true").lower()
                 in {"1", "true", "yes"},
@@ -229,6 +280,12 @@ def load_settings() -> Settings:
                 ),
                 jwt_token=env.get("SPEECHMATICS_JWT"),
                 jwt_ttl_seconds=int(env.get("SPEECHMATICS_JWT_TTL", "3600")),
+                max_reconnect_attempts=int(
+                    env.get("SPEECHMATICS_MAX_RECONNECT_ATTEMPTS", "3")
+                ),
+                reconnect_backoff_seconds=float(
+                    env.get("SPEECHMATICS_RECONNECT_BACKOFF_SECONDS", "3.0")
+                ),
             )
 
         if backend is BackendChoice.SPEECHMATICS and speechmatics_cfg is None:
@@ -335,30 +392,18 @@ def load_settings() -> Settings:
             vosk=vosk_cfg,
             whisper=whisper_cfg,
             audio=AudioInputConfig(
-                device_index=(
-                    int(env["AUDIO_DEVICE_INDEX"])
-                    if "AUDIO_DEVICE_INDEX" in env
-                    else None
-                ),
+                device_index=_optional_int(env, "AUDIO_DEVICE_INDEX"),
                 sample_rate=int(env.get("AUDIO_SAMPLE_RATE", "16000")),
-                device_sample_rate=(
-                    int(env["AUDIO_DEVICE_SAMPLE_RATE"])
-                    if "AUDIO_DEVICE_SAMPLE_RATE" in env
-                    else None
-                ),
+                device_sample_rate=_optional_int(env, "AUDIO_DEVICE_SAMPLE_RATE"),
                 channels=int(env.get("AUDIO_CHANNELS", "1")),
                 chunk_duration_seconds=float(env.get("AUDIO_CHUNK_DURATION_SECONDS", "0.5")),
-                blocksize=(
-                    int(env["AUDIO_BLOCKSIZE"])
-                    if "AUDIO_BLOCKSIZE" in env
-                    else None
-                ),
+                blocksize=_optional_int(env, "AUDIO_BLOCKSIZE"),
                 device_check_interval=float(env.get("AUDIO_DEVICE_CHECK_INTERVAL", "2.0")),
                 mode=audio_mode,
                 auto_setup_loopback=audio_auto_setup,
-                linux_loopback_sink=env.get("AUDIO_LINUX_LOOPBACK_SINK"),
-                windows_loopback_device=env.get("AUDIO_WINDOWS_LOOPBACK_DEVICE"),
-                mac_loopback_device=env.get("AUDIO_MAC_LOOPBACK_DEVICE"),
+                linux_loopback_sink=_blank_to_none(env.get("AUDIO_LINUX_LOOPBACK_SINK")),
+                windows_loopback_device=_blank_to_none(env.get("AUDIO_WINDOWS_LOOPBACK_DEVICE")),
+                mac_loopback_device=_blank_to_none(env.get("AUDIO_MAC_LOOPBACK_DEVICE")),
                 level_monitor_enabled=env.get("AUDIO_LEVEL_MONITOR_ENABLED", "false").lower()
                 in {"1", "true", "yes"},
                 level_silence_threshold_dbfs=float(

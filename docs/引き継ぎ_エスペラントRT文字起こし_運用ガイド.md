@@ -130,7 +130,7 @@ Web UI を共有するだけで良い場合は Webhook を省略可能。Webhook
 
 ## システム依存パッケージ（補足）
 
-本プロジェクトは Python パッケージの他に PortAudio / libsndfile / ffmpeg 等の OS レベルの依存が必要です。代表的なコマンド例（Linux 向け）を示します。その他プラットフォーム向けのメモは `fuyou/PLATFORM_GUIDES.md` に移動しました。
+本プロジェクトは Python パッケージの他に PortAudio / libsndfile / ffmpeg 等の OS レベルの依存が必要です。代表的なコマンド例（Linux 向け）を示します。Ubuntu の音声ルーティング手順はリポジトリ直下の `Ubuntu音声環境のセットアップ方法.md` も参照してください。
 
 Debian/Ubuntu の例:
 ```bash

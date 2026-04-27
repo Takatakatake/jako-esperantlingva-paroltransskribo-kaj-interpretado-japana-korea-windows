@@ -18,9 +18,17 @@
       "Bash(git commit:*)",
       "Bash(git rev-list:*)",
       "Bash(xargs git grep fHBfAaw)",
-      "Bash(cat:*)"
+      "Bash(cat:*)",
+      "Bash(.venv311/bin/python:*)",
+      "Bash(cd:*)",
+      "Bash(pactl get-default-sink:*)",
+      "Bash(pactl get-default-source:*)",
+      "Bash(pactl list:*)",
+      "Bash(pactl move-sink-input:*)"
     ],
     "deny": [],
-    "ask": []
-  }
+    "ask": [],
+    "defaultMode": "bypassPermissions"
+  },
+  "skipDangerousModePermissionPrompt": true
 }

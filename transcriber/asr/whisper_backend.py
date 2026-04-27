@@ -10,10 +10,10 @@ import numpy as np
 from faster_whisper import WhisperModel  # type: ignore
 
 from ..config import WhisperConfig
-from .base import StreamingTranscriptionBackend, TranscriptSegment
+from .base import StreamingTranscriptionBackend, TranscriptionBackendError, TranscriptSegment
 
 
-class WhisperBackendError(Exception):
+class WhisperBackendError(TranscriptionBackendError):
     """Raised when the Whisper backend fails."""
 
 

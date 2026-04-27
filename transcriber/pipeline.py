@@ -3,25 +3,18 @@
 from __future__ import annotations
 
 import asyncio
-import logging
-import re
-import webbrowser
 import functools
+import logging
+import os
+import re
+import sys
+import webbrowser
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from .asr import (
-    SpeechmaticsRealtimeBackend,
-    SpeechmaticsRealtimeError,
-    StreamingTranscriptionBackend,
-    TranscriptSegment,
-    VoskBackendError,
-    VoskStreamingBackend,
-    WhisperBackendError,
-    WhisperStreamingBackend,
-)
+from .asr.base import StreamingTranscriptionBackend, TranscriptionBackendError
 from .audio import AudioCaptureError, AudioChunkStream
 from .audio_setup import AudioEnvironmentError, AudioEnvironmentManager
 from .config import BackendChoice, Settings, load_settings
@@ -240,17 +233,24 @@ class TranscriptionPipeline:
                         else:
                             if self.settings.web.open_browser:
                                 url = f"http://{self.settings.web.host}:{self._web_ui.port}"
-                                loop = asyncio.get_running_loop()
-                                await loop.run_in_executor(None, functools.partial(webbrowser.open, url))
+                                logging.info("Opening caption board in default browser: %s", url)
+                                try:
+                                    if sys.platform.startswith("win"):
+                                        os.startfile(url)  # type: ignore[attr-defined]
+                                    else:
+                                        loop = asyncio.get_running_loop()
+                                        await loop.run_in_executor(
+                                            None, functools.partial(webbrowser.open, url, new=1)
+                                        )
+                                except Exception as exc:  # noqa: BLE001
+                                    logging.warning("Failed to open browser automatically: %s", exc)
                     async with self._audio_stream.connect() as audio_stream:
                         async with backend:
                             await self._main_loop(audio_stream, backend)
-        except (
-            AudioCaptureError,
-            SpeechmaticsRealtimeError,
-            VoskBackendError,
-            WhisperBackendError,
-        ) as exc:
+        except AudioCaptureError as exc:
+            logging.error("Pipeline stopped due to error: %s", exc)
+            raise
+        except TranscriptionBackendError as exc:
             logging.error("Pipeline stopped due to error: %s", exc)
             raise
         finally:
@@ -277,30 +277,62 @@ class TranscriptionPipeline:
         transcript_task = asyncio.create_task(
             self._consume_transcripts(backend), name="transcript-consumer"
         )
+        tasks = {audio_task, transcript_task}
+        first_error: Optional[BaseException] = None
+        cancelled = False
 
-        done, pending = await asyncio.wait(
-            {audio_task, transcript_task},
-            return_when=asyncio.FIRST_EXCEPTION,
-        )
-        for task in pending:
-            task.cancel()
-        for task in done:
-            task.result()
+        try:
+            done, _pending = await asyncio.wait(
+                tasks,
+                return_when=asyncio.FIRST_EXCEPTION,
+            )
+            for task in done:
+                try:
+                    task.result()
+                except asyncio.CancelledError:
+                    continue
+                except Exception as exc:  # noqa: BLE001
+                    first_error = exc
+                    break
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            if not cancelled and first_error is None:
+                for result in results:
+                    if isinstance(result, Exception) and not isinstance(
+                        result, asyncio.CancelledError
+                    ):
+                        first_error = result
+                        break
+
+        if first_error is not None:
+            raise first_error
 
     def _create_backend(self) -> StreamingTranscriptionBackend:
         if self.backend_choice is BackendChoice.SPEECHMATICS:
             if not self.settings.speechmatics:
                 raise RuntimeError("Speechmatics configuration missing.")
+            from .asr.speechmatics_backend import SpeechmaticsRealtimeBackend
+
             return SpeechmaticsRealtimeBackend(self.settings.speechmatics)
 
         if self.backend_choice is BackendChoice.VOSK:
             if not self.settings.vosk:
                 raise RuntimeError("Vosk configuration missing.")
+            from .asr.vosk_backend import VoskStreamingBackend
+
             return VoskStreamingBackend(self.settings.vosk)
 
         if self.backend_choice is BackendChoice.WHISPER:
             if not self.settings.whisper:
                 raise RuntimeError("Whisper configuration missing.")
+            from .asr.whisper_backend import WhisperStreamingBackend
+
             return WhisperStreamingBackend(
                 self.settings.whisper, self.settings.audio.sample_rate
             )

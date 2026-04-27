@@ -49,6 +49,21 @@ test -f .env || cp .env.example .env
 
 Prefer a guided setup? Run `./setup_venv311.sh` (or `bash scripts/setup_venv311.sh`) and the script will locate Python 3.11 (or newer), create `.venv311`, upgrade pip tooling, and install `requirements.txt` with friendly prompts.
 
+Right after `source .venv311/bin/activate`, verify which Python is actually active:
+
+```bash
+which python
+python -V
+python -c "import sys; print(sys.executable)"
+```
+
+If `which python` is not `.venv311/bin/python` (for example `/home/.../anaconda3/bin/python`), your venv likely has an internal path mismatch. Fastest recovery:
+
+```bash
+bash scripts/setup_venv311.sh --force --non-interactive --python /usr/bin/python3.11
+source .venv311/bin/activate
+```
+
 ### Ultra-simple launch (first-time friendly)
 
 - **Linux**: Run `./easy_start.sh` or `bash scripts/easy_start.sh`. If necessary, grant execute permission with `chmod +x easy_start.sh`.
@@ -62,6 +77,8 @@ Edit these fields (example):
 SPEECHMATICS_API_KEY=****************************   # replace with your real key
 SPEECHMATICS_CONNECTION_URL=wss://<region>.rt.speechmatics.com/v2   # region base URL form (e.g. eu2 or us2)
 SPEECHMATICS_LANGUAGE=eo                                     # language code (e.g. eo). The actual connection will be to <base>/v2/<language> (e.g. wss://eu2.rt.speechmatics.com/v2/eo).
+SPEECHMATICS_AUTH_MODE=temporary_key                         # temporary_key / api_key
+SPEECHMATICS_OPERATING_POINT=standard                        # standard / enhanced
 AUDIO_DEVICE_INDEX=8                               # from --list-devices
 AUDIO_DEVICE_SAMPLE_RATE=48000                     # hardware sample rate (e.g. 48000/44100)
 AUDIO_CAPTURE_MODE=loopback                        # loopback / microphone / api / auto
@@ -76,11 +93,26 @@ Then verify devices and start:
 ```bash
 python -m transcriber.cli --list-devices
 python -m transcriber.cli --diagnose-audio
+python -m transcriber.cli --audio-routing-guide
+python -m transcriber.cli --test-audio-levels 3
 python -m transcriber.cli --log-level=INFO
 ```
 
 Open the Web UI at `http://127.0.0.1:8765` (set `WEB_UI_OPEN_BROWSER=true` to auto-open).
 `--diagnose-audio` summarises loopback candidates and configuration hints. On Linux you can provision virtual devices via `scripts/setup_audio_loopback_linux.sh`.
+
+Switch Speechmatics accuracy with `SPEECHMATICS_OPERATING_POINT`. The CLI command below edits `.env` safely and creates a `.env.bak.*` backup.
+
+```bash
+python -m transcriber.cli --set-speechmatics-operating-point enhanced
+python -m transcriber.cli --set-speechmatics-operating-point standard
+python -m transcriber.cli --set-speechmatics-auth-mode temporary_key
+python -m transcriber.cli --set-speechmatics-auth-mode api_key
+python -m transcriber.cli --list-env-backups
+python -m transcriber.cli --restore-env-backup latest
+```
+
+For normal Ubuntu operation, keep `SPEECHMATICS_AUTH_MODE=temporary_key`; it preserves the existing API-key to short-lived realtime key flow. `api_key` skips that exchange and sends the API key directly as the server-side WebSocket Bearer token.
 
 ---
 
@@ -103,6 +135,8 @@ TRANSCRIPTION_BACKEND=speechmatics  # or vosk / whisper
 SPEECHMATICS_API_KEY=sk_live_************************
 SPEECHMATICS_APP_ID=realtime
 SPEECHMATICS_LANGUAGE=eo
+SPEECHMATICS_AUTH_MODE=temporary_key
+SPEECHMATICS_OPERATING_POINT=standard
 ZOOM_CC_POST_URL=https://wmcc.zoom.us/closedcaption?... (host-provided URL)
 ```
 
@@ -115,6 +149,7 @@ AUDIO_DEVICE_SAMPLE_RATE=48000
 AUDIO_CHUNK_DURATION_SECONDS=0.5
 AUDIO_CAPTURE_MODE=loopback
 AUDIO_AUTO_SETUP_LOOPBACK=true
+# Linux: physical sink to hear through, not the recording monitor.
 # AUDIO_LINUX_LOOPBACK_SINK=alsa_output.pci-0000_00_1f.3.analog-stereo
 AUDIO_LEVEL_MONITOR_ENABLED=false
 AUDIO_LEVEL_SILENCE_THRESHOLD_DBFS=-45.0
@@ -191,6 +226,8 @@ scripts/test_translation.py "Bonvenon al nia kunsido."
 - Set `AUDIO_DEVICE_SAMPLE_RATE` to the physical capture rate (for example 48000 Hz). The pipeline resamples to 16 kHz internally so Speechmatics/Vosk/Whisper stay stable even when only 44.1/48 kHz hardware is available.
 - Keep `AUDIO_CHUNK_DURATION_SECONDS` between 0.1 and 0.5 seconds. Shorter chunks reduce latency but increase CPU/network usage.
 - Enable `AUDIO_LEVEL_MONITOR_ENABLED=true` to receive warnings when the input remains below the silence threshold (default -45 dBFS for 6 seconds) or hits the clipping ceiling (default -1 dBFS for 2 seconds). Adjust the thresholds/durations with the matching `.env` variables.
+- `python -m transcriber.cli --test-audio-levels 3` records a short sample without changing `.env` or system routing, then reports silence, clipping, and detected signal levels. Add `--test-audio-profile microphone` or `loopback` to probe the profile candidate.
+- `python -m transcriber.cli --apply-audio-profile microphone` / `loopback` backs up `.env` and switches the audio input settings. Restore with `--restore-env-backup latest`.
 - On Linux, automatic loopback setup now snapshots the default sink/source before switching and restores them as soon as the pipeline stops, so desktop audio routing returns to its original state automatically.
 
 ### Linux quick notes
@@ -199,6 +236,7 @@ scripts/test_translation.py "Bonvenon al nia kunsido."
 > Configure loopback routing manually if you are operating on macOS or Windows.
 
 - **Linux (PipeWire/PulseAudio)**: `scripts/setup_audio_loopback_linux.sh` provisions a null sink and switches the default source to its monitor. When invoked via `run_transcriber.sh` or `python -m transcriber.cli --easy-start`, the CLI snapshots the original defaults and restores them on shutdown; running the script by itself leaves the virtual sink active until you revert manually (e.g., `scripts/reset_audio_defaults.sh`). Confirm that `python -m transcriber.cli --diagnose-audio` lists `pipewire`/`default` as loopback candidates.
+- `Ubuntu音声環境のセットアップ方法.md` contains the full Ubuntu routing procedure. `ubuntu_loopback_ideal_state.md` keeps the shorter diagram and checklist.
 - Start with `python -m transcriber.cli --check-environment` to ensure dependencies and configuration are ready, then run `python -m transcriber.cli --diagnose-audio` to confirm audio routing before joining a meeting.
 - Need a guided walkthrough? Run `python -m transcriber.cli --setup-wizard` to list the required steps and recommended tooling.
 - To revert audio defaults at any time, run `bash scripts/reset_audio_defaults.sh` (Linux/PipeWire) and choose the devices you want.
@@ -240,7 +278,7 @@ Anticipated extensions:
 
 ## Validation & Next Steps
 
-1) Validate the Speechmatics handshake (`StartRecognition` schema). The current build does not ship custom dictionary or `operating_point` parameters—extend `speechmatics_backend.py` if you need to send those options.  
+1) Validate the Speechmatics handshake (`StartRecognition` schema). `SPEECHMATICS_OPERATING_POINT=enhanced` sends `operating_point`; `standard` omits it and uses the default model.
 2) Dry-run with recorded audio; measure WER/diarization/latency.  
 3) Register frequent words in the Speechmatics Custom Dictionary; mirror vocabulary for Vosk post-processing if needed.  
 4) Validate the offline path with Vosk and compare WER/latency.  
@@ -344,6 +382,16 @@ python3 scripts/diagnose_audio.py
   ```ini
   AUDIO_DEVICE_CHECK_INTERVAL=5.0
   AUDIO_DEVICE_INDEX=8
+  ```
+- `ModuleNotFoundError: No module named 'sounddevice'` appears (traceback shows `/home/.../anaconda3/lib/python3.8/runpy.py`):
+  - Cause: Conda Python is still taking precedence even after venv activation.
+  - Fix: rebuild `.venv311`, reactivate, and re-check Python resolution.
+  ```bash
+  bash scripts/setup_venv311.sh --force --non-interactive --python /usr/bin/python3.11
+  source .venv311/bin/activate
+  which python
+  python -V
+  python -c "import sounddevice, sys; print(sys.executable)"
   ```
 
 See `docs/ubuntu_audio_troubleshooting.md` for more details.

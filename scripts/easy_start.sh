@@ -23,7 +23,9 @@ if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   fi
 fi
 
-if ! "$PYTHON_BIN" -m transcriber.cli --easy-start "$@"; then
+if "$PYTHON_BIN" -m transcriber.cli --easy-start "$@"; then
+  exit 0
+else
   status=$?
   printf '[easy_start] CLI exited with code %d. 詳細は上記ログまたは logs/ ディレクトリを確認してください。\n' "$status" >&2
   exit "$status"

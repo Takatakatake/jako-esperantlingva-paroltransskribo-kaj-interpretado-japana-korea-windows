@@ -190,7 +190,10 @@ class EnvCheckTests(unittest.TestCase):
 
         mock_run_pipeline.side_effect = fake_pipeline
 
-        with mock.patch("builtins.input", side_effect=["y", "y"]), mock.patch.dict(os.environ, {}, clear=True):
+        stdin = SimpleNamespace(isatty=lambda: True)
+        with mock.patch("transcriber.cli.sys.stdin", stdin), mock.patch(
+            "builtins.input", side_effect=["y", "y"]
+        ), mock.patch.dict(os.environ, {}, clear=True):
             result = run_easy_start()
 
         self.assertTrue(result)

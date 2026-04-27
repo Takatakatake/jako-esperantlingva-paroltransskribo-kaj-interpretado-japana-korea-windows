@@ -19,6 +19,10 @@ class TranscriptSegment:
     raw: Optional[dict] = None
 
 
+class TranscriptionBackendError(Exception):
+    """Base class for backend-specific transcription failures."""
+
+
 class StreamingTranscriptionBackend(abc.ABC):
     """Interface for realtime speech-to-text streaming backends."""
 

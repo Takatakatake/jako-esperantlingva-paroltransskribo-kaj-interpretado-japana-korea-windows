@@ -31,6 +31,11 @@ CRITICAL_FILES = [
 ]
 
 DEFAULT_GOOGLE_CREDENTIAL = "gen-lang-client-0219123936-d6e117f5a590.json"
+DEFAULT_SPEECHMATICS_CONNECTION_URL = "wss://eu2.rt.speechmatics.com/v2"
+DEFAULT_SPEECHMATICS_LANGUAGE = "eo"
+SUPPORTED_PYTHON_MIN = (3, 11)
+SUPPORTED_PYTHON_MAX_EXCLUSIVE = (3, 13)
+PLACEHOLDER_MARKERS = ("YOUR_", "REPLACE_", "PLACEHOLDER", "_HERE", "*****")
 
 
 def _print_section(title: str) -> None:
@@ -50,6 +55,20 @@ def _check_packages() -> Tuple[List[str], List[str]]:
     return installed, missing
 
 
+def _check_python_version() -> List[str]:
+    """Return Python-version readiness issues for this project."""
+
+    current = sys.version_info
+    if current < SUPPORTED_PYTHON_MIN:
+        return ["Python 3.11 or 3.12 is required. Recreate .venv311 with Python 3.11."]
+    if current >= SUPPORTED_PYTHON_MAX_EXCLUSIVE:
+        return [
+            "Python 3.13+ is not currently supported by this project. Use Python 3.11 or 3.12 "
+            "because the audio stack and dependencies are validated there."
+        ]
+    return []
+
+
 def _read_env_pairs(env_path: Path) -> Dict[str, str]:
     pairs: Dict[str, str] = {}
     try:
@@ -63,6 +82,16 @@ def _read_env_pairs(env_path: Path) -> Dict[str, str]:
     except FileNotFoundError:
         pass
     return pairs
+
+
+def _is_placeholder_value(value: str) -> bool:
+    """Detect template values copied from .env.example before real secrets are added."""
+
+    cleaned = value.strip().strip('"').strip("'")
+    if not cleaned or cleaned == "***":
+        return True
+    upper = cleaned.upper()
+    return any(marker in upper for marker in PLACEHOLDER_MARKERS)
 
 
 def _section_packages(installed: Iterable[str], missing: Iterable[str]) -> None:
@@ -108,6 +137,10 @@ def _section_logs_and_env(env_pairs: Dict[str, str]) -> Tuple[bool, List[str], L
 
     critical_keys = [
         ("SPEECHMATICS_API_KEY", True),
+        ("SPEECHMATICS_CONNECTION_URL", False),
+        ("SPEECHMATICS_LANGUAGE", False),
+        ("SPEECHMATICS_AUTH_MODE", False),
+        ("SPEECHMATICS_OPERATING_POINT", False),
         ("AUDIO_DEVICE_INDEX", False),
         ("GOOGLE_TRANSLATE_CREDENTIALS_PATH", True),
     ]
@@ -117,42 +150,99 @@ def _section_logs_and_env(env_pairs: Dict[str, str]) -> Tuple[bool, List[str], L
         if key in env_pairs:
             value = env_pairs[key]
             if key == "SPEECHMATICS_API_KEY":
-                status = "*** set ***" if value and value != "***" else "not configured"
+                is_placeholder = _is_placeholder_value(value)
+                status = "*** set ***" if value and not is_placeholder else "not configured"
                 print(f"    {key} = {status}")
-                if not value or value == "***":
-                    issues.append("SPEECHMATICS_API_KEY not set in .env")
+                if is_placeholder:
+                    issues.append("SPEECHMATICS_API_KEY is missing or still uses the .env.example placeholder.")
+            elif key == "SPEECHMATICS_CONNECTION_URL":
+                if value:
+                    print(f"    {key} = {value}")
+                else:
+                    print(f"    {key} = (empty; default would be {DEFAULT_SPEECHMATICS_CONNECTION_URL})")
+                    issues.append("SPEECHMATICS_CONNECTION_URL is empty in .env")
+            elif key == "SPEECHMATICS_LANGUAGE":
+                if value:
+                    print(f"    {key} = {value}")
+                else:
+                    print(f"    {key} = (empty; default would be {DEFAULT_SPEECHMATICS_LANGUAGE})")
+                    issues.append("SPEECHMATICS_LANGUAGE is empty in .env")
+            elif key == "SPEECHMATICS_AUTH_MODE":
+                auth_mode = (value or "temporary_key").lower()
+                aliases = {
+                    "api": "api_key",
+                    "direct": "api_key",
+                    "jwt": "temporary_key",
+                    "temporary": "temporary_key",
+                    "temp": "temporary_key",
+                }
+                auth_mode = aliases.get(auth_mode, auth_mode)
+                print(f"    {key} = {auth_mode}")
+                if auth_mode not in {"api_key", "temporary_key"}:
+                    issues.append("SPEECHMATICS_AUTH_MODE must be api_key or temporary_key.")
+            elif key == "SPEECHMATICS_OPERATING_POINT":
+                operating_point = (value or "standard").lower()
+                print(f"    {key} = {operating_point}")
+                if operating_point == "enhanced":
+                    warnings.append(
+                        "SPEECHMATICS_OPERATING_POINT=enhanced requires enhanced realtime quota/entitlement."
+                    )
+                elif operating_point != "standard":
+                    issues.append("SPEECHMATICS_OPERATING_POINT must be standard or enhanced.")
             elif key == "AUDIO_DEVICE_INDEX":
                 if value:
                     print(f"    {key} = {value}")
                 else:
                     print(f"    {key} = (auto: system default input)")
                     warnings.append("AUDIO_DEVICE_INDEX left empty; using system default input.")
-            else:  # GOOGLE_TRANSLATE_CREDENTIALS_PATH
-                status = value or "not configured"
+            else:
+                is_placeholder = _is_placeholder_value(value)
+                status = value if value and not is_placeholder else "not configured"
                 print(f"    {key} = {status}")
-                if not value:
-                    issues.append("GOOGLE_TRANSLATE_CREDENTIALS_PATH not set in .env")
+                if is_placeholder:
+                    issues.append(
+                        "GOOGLE_TRANSLATE_CREDENTIALS_PATH is missing or still uses the .env.example placeholder."
+                    )
         else:
             if required:
                 print(f"    {key} = (missing)")
                 issues.append(f"{key} not set in .env")
             else:
-                print(f"    {key} = (auto: system default input)")
-                warnings.append("AUDIO_DEVICE_INDEX not set; using system default input.")
+                if key == "SPEECHMATICS_OPERATING_POINT":
+                    print(f"    {key} = standard (default)")
+                elif key == "SPEECHMATICS_CONNECTION_URL":
+                    print(f"    {key} = {DEFAULT_SPEECHMATICS_CONNECTION_URL} (default)")
+                elif key == "SPEECHMATICS_LANGUAGE":
+                    print(f"    {key} = {DEFAULT_SPEECHMATICS_LANGUAGE} (default)")
+                elif key == "SPEECHMATICS_AUTH_MODE":
+                    print(f"    {key} = temporary_key (default)")
+                else:
+                    print(f"    {key} = (auto: system default input)")
+                    warnings.append("AUDIO_DEVICE_INDEX not set; using system default input.")
 
     return True, issues, warnings
 
 
-def _section_credentials(env_pairs: Dict[str, str]) -> None:
+def _section_credentials(env_pairs: Dict[str, str]) -> List[str]:
+    issues: List[str] = []
     _print_section("6. Google 認証ファイル / Google credentials")
     credential_path = env_pairs.get(
         "GOOGLE_TRANSLATE_CREDENTIALS_PATH", DEFAULT_GOOGLE_CREDENTIAL
     )
+    if _is_placeholder_value(credential_path):
+        print("  ✗ Google credential path is not configured")
+        issues.append(
+            "Set GOOGLE_TRANSLATE_CREDENTIALS_PATH to your local service-account JSON path."
+        )
+        return issues
+
     path = Path(credential_path).expanduser()
     if path.exists():
         print(f"  ✓ {path} found")
     else:
         print(f"  ✗ Credential file missing: {path}")
+        issues.append(f"Google credential file missing: {path}")
+    return issues
 
 
 def _print_os_guidance() -> None:
@@ -179,6 +269,10 @@ def run_environment_check() -> bool:
     print(f"Platform : {platform.platform()}")
     print(f"Python   : {sys.version}")
     print(f"Executable: {sys.executable}")
+    python_issues = _check_python_version()
+    if python_issues:
+        for issue in python_issues:
+            print(f"  ✗ {issue}")
 
     _print_section("2. requirements.txt preview")
     req_path = Path("requirements.txt")
@@ -197,17 +291,19 @@ def run_environment_check() -> bool:
 
     env_pairs = _read_env_pairs(Path(".env"))
     env_ok, env_issues, env_warnings = _section_logs_and_env(env_pairs)
-    _section_credentials(env_pairs)
+    credential_issues = _section_credentials(env_pairs)
     _print_os_guidance()
 
     _print_section("8. 総合結果 / Summary")
     issues: List[str] = []
     warnings: List[str] = env_warnings.copy()
+    issues.extend(python_issues)
     if missing:
         issues.append(f"Missing packages: {', '.join(missing)}")
     if missing_files:
         issues.append(f"Missing files: {', '.join(missing_files)}")
     issues.extend(env_issues)
+    issues.extend(credential_issues)
 
     if issues:
         print("  ✗ Not ready yet. Address the following:")

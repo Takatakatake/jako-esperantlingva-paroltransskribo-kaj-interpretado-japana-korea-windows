@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 import asyncio
-import audioop
 import logging
 import math
 import queue
 import time
 from contextlib import asynccontextmanager
 from array import array
-from typing import AsyncGenerator, List, Optional
+from typing import Any, AsyncGenerator, List, Optional
 
+try:
+    import audioop
+except ImportError:  # pragma: no cover - exercised on Python 3.13+
+    audioop = None  # type: ignore[assignment]
+
+import numpy as np
 import sounddevice as sd
 
 from .config import AudioInputConfig
@@ -19,6 +24,52 @@ from .config import AudioInputConfig
 
 class AudioCaptureError(Exception):
     """Raised when the audio subsystem cannot be initialised."""
+
+
+def _pcm16_array(chunk: bytes) -> np.ndarray:
+    return np.frombuffer(chunk, dtype=np.int16)
+
+
+def _resample_pcm16_mono(
+    chunk: bytes,
+    source_rate: int,
+    target_rate: int,
+    state: Optional[Any],
+) -> tuple[bytes, Optional[Any]]:
+    if audioop is not None:
+        return audioop.ratecv(chunk, 2, 1, source_rate, target_rate, state)
+
+    samples = _pcm16_array(chunk)
+    if samples.size == 0 or source_rate == target_rate:
+        return chunk, state
+
+    output_count = max(1, int(round(samples.size * target_rate / source_rate)))
+    if samples.size == 1:
+        resampled = np.repeat(samples, output_count)
+    else:
+        src_x = np.linspace(0.0, 1.0, num=samples.size, endpoint=True)
+        dst_x = np.linspace(0.0, 1.0, num=output_count, endpoint=True)
+        resampled = np.interp(dst_x, src_x, samples.astype(np.float32))
+    resampled = np.clip(np.rint(resampled), -32768, 32767).astype(np.int16)
+    return resampled.tobytes(), state
+
+
+def _pcm16_rms(chunk: bytes) -> int:
+    if audioop is not None:
+        return audioop.rms(chunk, 2)
+    samples = _pcm16_array(chunk).astype(np.float64)
+    if samples.size == 0:
+        return 0
+    return int(math.sqrt(float(np.mean(samples * samples))))
+
+
+def _pcm16_peak(chunk: bytes) -> int:
+    if audioop is not None:
+        return audioop.max(chunk, 2)
+    samples = _pcm16_array(chunk)
+    if samples.size == 0:
+        return 0
+    return int(np.max(np.abs(samples.astype(np.int32))))
 
 
 class AudioChunkStream:
@@ -37,6 +88,8 @@ class AudioChunkStream:
         self._last_chunk_time: float = 0.0
         self._chunk_timeout: float = 5.0  # Consider stream dead if no chunks for 5 seconds
         self._last_missing_device_index: Optional[int] = None
+        self._last_named_resolution: Optional[int] = None
+        self._last_index_mismatch: Optional[tuple[int, str, int]] = None
         self._needs_downmix = self.config.channels > 1
         self._downmix_warning_logged = False
         self._fatal_error: Optional[AudioCaptureError] = None
@@ -48,7 +101,7 @@ class AudioChunkStream:
                 self._target_sample_rate,
             )
         self._resample_needed = self._device_sample_rate != self._target_sample_rate
-        self._resample_state: Optional[tuple[int, int]] = None
+        self._resample_state: Optional[Any] = None
         self._resample_buffer = bytearray()
         self._target_frame_count = max(
             1, int(round(self._target_sample_rate * self.config.chunk_duration_seconds))
@@ -84,21 +137,131 @@ class AudioChunkStream:
             logging.warning("Failed to query default input device: %s", exc)
         return None
 
-    def _get_effective_device(self) -> Optional[int]:
-        """Get the device index to use (configured or system default)."""
+    @staticmethod
+    def _device_name_matches(preferred_name: str, actual_name: str) -> bool:
+        preferred = " ".join(preferred_name.lower().split())
+        actual = " ".join(actual_name.lower().split())
+        if not preferred or not actual:
+            return False
+        return preferred == actual or preferred in actual or actual in preferred
+
+    @staticmethod
+    def _hostapi_name(hostapi_index: object) -> str:
+        try:
+            index = int(hostapi_index)
+            hostapis = sd.query_hostapis()
+            if 0 <= index < len(hostapis):
+                return str(hostapis[index].get("name", index))
+        except Exception:  # noqa: BLE001
+            return ""
+        return ""
+
+    def _find_named_input_device(self, preferred_name: Optional[str]) -> Optional[int]:
+        """Find a preferred input device by name when saved indexes shift."""
+
+        preferred = (preferred_name or "").strip()
+        if not preferred:
+            return None
+
+        try:
+            devices = sd.query_devices()
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Failed to enumerate audio devices while resolving %r: %s", preferred, exc)
+            return None
+
+        candidates: List[tuple[int, int, int, int, int, str]] = []
+        for index, device in enumerate(devices):
+            try:
+                inputs = int(device.get("max_input_channels", 0))
+            except Exception:  # noqa: BLE001
+                inputs = 0
+            if inputs <= 0:
+                continue
+
+            actual_name = str(device.get("name", ""))
+            if not self._device_name_matches(preferred, actual_name):
+                continue
+
+            hostapi_name = self._hostapi_name(device.get("hostapi", -1)).lower()
+            actual_lower = actual_name.lower()
+            default_rate = device.get("default_samplerate")
+            try:
+                rate_matches = int(round(float(default_rate))) == self._device_sample_rate
+            except Exception:  # noqa: BLE001
+                rate_matches = False
+
+            candidates.append(
+                (
+                    0 if actual_name.lower() == preferred.lower() else 1,
+                    0 if any(api in hostapi_name for api in ("wasapi", "pulse", "pipewire")) else 1,
+                    0 if any(term in actual_lower for term in ("monitor", "loopback", "cable output")) else 1,
+                    0 if rate_matches else 1,
+                    index,
+                    actual_name,
+                )
+            )
+
+        if not candidates:
+            return None
+
+        _exact, _hostapi, _loopback, _rate, index, actual_name = sorted(candidates)[0]
+        if index != self.config.device_index and self._last_named_resolution != index:
+            logging.info(
+                "Resolved preferred audio device by name: #%s %s.",
+                index,
+                actual_name,
+            )
+        self._last_named_resolution = index
+        return index
+
+    def _get_preferred_configured_device(self) -> Optional[int]:
+        """Resolve the configured device, preferring stable names over stale indexes."""
+
+        preferred_name = (
+            self.config.linux_loopback_sink
+            or self.config.windows_loopback_device
+            or self.config.mac_loopback_device
+        )
+        named_device = self._find_named_input_device(preferred_name)
         if self.config.device_index is not None:
             try:
-                sd.query_devices(self.config.device_index, kind="input")
+                configured_info = sd.query_devices(self.config.device_index, kind="input")
                 self._last_missing_device_index = None
-                return self.config.device_index
             except Exception as exc:
                 if self._last_missing_device_index != self.config.device_index:
                     logging.warning(
-                        "Configured audio device index %s unavailable (%s); falling back to default.",
+                        "Configured audio device index %s unavailable (%s).",
                         self.config.device_index,
                         exc,
                     )
                     self._last_missing_device_index = self.config.device_index
+                return named_device
+
+            configured_name = str(configured_info.get("name", ""))
+            if preferred_name and not self._device_name_matches(preferred_name, configured_name):
+                if named_device is not None:
+                    mismatch = (self.config.device_index, configured_name, named_device)
+                    if self._last_index_mismatch != mismatch:
+                        logging.warning(
+                            "AUDIO_DEVICE_INDEX=%s points to %r, but preferred device %r "
+                            "now resolves to device index %s. Using the named device.",
+                            self.config.device_index,
+                            configured_name,
+                            preferred_name,
+                            named_device,
+                        )
+                    self._last_index_mismatch = mismatch
+                    return named_device
+            self._last_index_mismatch = None
+            return self.config.device_index
+
+        return named_device
+
+    def _get_effective_device(self) -> Optional[int]:
+        """Get the device index to use (configured or system default)."""
+        preferred = self._get_preferred_configured_device()
+        if preferred is not None:
+            return preferred
         return self._get_default_input_device()
 
     def _callback(self, indata: bytes, frames: int, _time, status: sd.CallbackFlags) -> None:
@@ -125,10 +288,8 @@ class AudioChunkStream:
         data = chunk
         if self._resample_needed:
             try:
-                data, self._resample_state = audioop.ratecv(
+                data, self._resample_state = _resample_pcm16_mono(
                     chunk,
-                    2,
-                    1,
                     self._device_sample_rate,
                     self._target_sample_rate,
                     self._resample_state,
@@ -196,7 +357,7 @@ class AudioChunkStream:
         """Track RMS/peak levels and log anomalies."""
 
         # RMS in dBFS
-        rms = audioop.rms(chunk, 2)
+        rms = _pcm16_rms(chunk)
         if rms <= 0:
             level_db = float("-inf")
         else:
@@ -220,7 +381,7 @@ class AudioChunkStream:
         else:
             self._silence_accumulator = 0.0
 
-        peak = audioop.max(chunk, 2)
+        peak = _pcm16_peak(chunk)
         if peak <= 0:
             peak_db = float("-inf")
         else:
@@ -314,9 +475,10 @@ class AudioChunkStream:
             if candidate not in attempt_devices:
                 attempt_devices.append(candidate)
 
+        add_candidate(self._get_preferred_configured_device())
+        add_candidate(device)
         if self.config.device_index is not None:
             add_candidate(self.config.device_index)
-        add_candidate(device)
         if device is not None:
             add_candidate(self._get_default_input_device())
             add_candidate(None)
@@ -421,7 +583,7 @@ class AudioChunkStream:
                                 logging.error("Failed to reconnect to new device: %s", exc)
                                 self._register_fatal_error(AudioCaptureError(str(exc)))
                 else:
-                    preferred = self.config.device_index
+                    preferred = self._get_preferred_configured_device()
                     if preferred is not None and self._current_device != preferred:
                         try:
                             sd.query_devices(preferred, kind="input")

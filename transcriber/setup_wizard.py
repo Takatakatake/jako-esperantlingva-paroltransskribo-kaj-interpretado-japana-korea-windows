@@ -26,6 +26,7 @@ def run_setup_wizard() -> None:
         "Create/activate your Python 3.11 virtual environment (.venv311).",
         "Run `python -m pip install -r requirements.txt` with the venv active.",
         "Copy `.env.example` to `.env` and fill in API keys (Speechmatics, Google, etc.).",
+        "Leave `SPEECHMATICS_OPERATING_POINT=standard` first; switch to `enhanced` only after quota/entitlement is confirmed.",
         "Execute `python -m transcriber.cli --check-environment` to verify dependencies/files.",
         "Adjust `AUDIO_DEVICE_INDEX`, `AUDIO_DEVICE_SAMPLE_RATE`, and translation targets as needed.",
     ]
@@ -59,6 +60,7 @@ def run_setup_wizard() -> None:
             "Run `scripts/setup_audio_loopback_linux.sh` (optionally set HEADPHONE_SINK) to create the virtual sink; defaults are restored automatically on exit.",
             "Set `AUDIO_DEVICE_SAMPLE_RATE` to your hardware rate (48kHz is common) and leave `AUDIO_DEVICE_INDEX` blank to use the monitor.",
             "Run `python -m transcriber.cli --diagnose-audio` to ensure `pipewire` or `default` monitors are recognised.",
+            "Run `python -m transcriber.cli --test-audio-levels 3 --test-audio-profile loopback` while playing target audio.",
             "If you prefer a fixed device, capture its index with `--list-devices` and set `.env` accordingly.",
             "Start the pipeline with `python -m transcriber.cli --log-level=INFO`.",
         ]
@@ -74,5 +76,6 @@ def run_setup_wizard() -> None:
 
     _print_header("Next actions")
     print("• Run `python -m transcriber.cli --diagnose-audio` whenever routing changes.")
+    print("• Use `python -m transcriber.cli --set-speechmatics-operating-point enhanced` only after enhanced realtime access is confirmed.")
     print("• Use `python -m transcriber.cli --setup-wizard` again if you switch OS or hardware.")
     print("• Refer to docs/audio_loopback.md and README for deeper troubleshooting tips.")

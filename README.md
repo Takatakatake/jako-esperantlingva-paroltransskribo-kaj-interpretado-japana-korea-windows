@@ -19,7 +19,7 @@ Zoom や Google Meet でのエスペラント会話を、低遅延でリアル�
 
 ## 前提条件（Prerequisites）
 
- - Python 3.10 以上（CPython 3.10/3.11 で検証）
+- Python 3.10 以上（CPython 3.10/3.11 で検証）
 - Python 3.11 の仮想環境を `.venv311` という名前で作成して利用してください。
 - 会議アプリの音声を PC 内へループバックする仕組み（PipeWire/PulseAudio/JACK など）
 - Speechmatics アカウント（Realtime の利用権限と API キー）
@@ -50,6 +50,21 @@ test -f .env || cp .env.example .env
 
 上記の手作業が不安な場合は、`./setup_venv311.sh`（または `bash scripts/setup_venv311.sh`）を実行すれば Python 3.11 の検出・仮想環境の作成・`requirements.txt` のインストールまで自動で案内してくれます。
 
+`source .venv311/bin/activate` の直後に、実際に有効化されている Python を確認してください:
+
+```bash
+which python
+python -V
+python -c "import sys; print(sys.executable)"
+```
+
+`which python` が `.venv311/bin/python` 以外（例: `/home/.../anaconda3/bin/python`）を指す場合は、仮想環境の内部パス不整合が起きています。最短で復旧するには以下を実行してください:
+
+```bash
+bash scripts/setup_venv311.sh --force --non-interactive --python /usr/bin/python3.11
+source .venv311/bin/activate
+```
+
 ### 超かんたん実行（初めての方向け）
 
 - **Linux**: ターミナルで `./easy_start.sh` または `bash scripts/easy_start.sh` を実行。必要なら `chmod +x easy_start.sh` で実行権限を付与してください。
@@ -63,6 +78,8 @@ test -f .env || cp .env.example .env
 SPEECHMATICS_API_KEY=****************************   # 本物のキーに置換
 SPEECHMATICS_CONNECTION_URL=wss://<region>.rt.speechmatics.com/v2   # region base URL の形式。例: eu2 または us2
 SPEECHMATICS_LANGUAGE=eo                                     # 言語コード（例: eo）。実際の接続先は <base>/v2/<language> の形式になります（例: wss://eu2.rt.speechmatics.com/v2/eo）。
+SPEECHMATICS_AUTH_MODE=temporary_key                         # temporary_key / api_key
+SPEECHMATICS_OPERATING_POINT=standard                        # standard / enhanced
 AUDIO_DEVICE_INDEX=8                               # --list-devices の番号
 AUDIO_DEVICE_SAMPLE_RATE=48000                     # ハードウェア側の実レート（例: 48000/44100）
 AUDIO_CAPTURE_MODE=loopback                        # loopback / microphone / api / auto
@@ -77,12 +94,27 @@ TRANSLATION_TARGETS=ja,ko
 ```bash
 python -m transcriber.cli --list-devices
 python -m transcriber.cli --diagnose-audio
+python -m transcriber.cli --audio-routing-guide
+python -m transcriber.cli --test-audio-levels 3
 python -m transcriber.cli --log-level=INFO
 ```
 
 Web UI は `http://127.0.0.1:8765` で開けます（`.env` の `WEB_UI_OPEN_BROWSER=true` で自動起動）。
 `--diagnose-audio` は現在の OS・ループバック候補・設定ミスをまとめて表示します。
 Linux では `scripts/setup_audio_loopback_linux.sh` で仮想デバイスを整備できます。
+
+Speechmatics の精度モードは `.env` の `SPEECHMATICS_OPERATING_POINT` で切り替えます。CLIから安全に変更する場合は以下を使ってください（`.env.bak.*` が作られます）。
+
+```bash
+python -m transcriber.cli --set-speechmatics-operating-point enhanced
+python -m transcriber.cli --set-speechmatics-operating-point standard
+python -m transcriber.cli --set-speechmatics-auth-mode temporary_key
+python -m transcriber.cli --set-speechmatics-auth-mode api_key
+python -m transcriber.cli --list-env-backups
+python -m transcriber.cli --restore-env-backup latest
+```
+
+通常は既存運用と同じ `SPEECHMATICS_AUTH_MODE=temporary_key` を推奨します。`api_key` は一時キー交換を行わず、サーバー側WebSocket接続でAPIキーを直接Bearerとして送るモードです。
 
 ---
 
@@ -105,6 +137,8 @@ TRANSCRIPTION_BACKEND=speechmatics  # or vosk / whisper
 SPEECHMATICS_API_KEY=sk_live_************************
 SPEECHMATICS_APP_ID=realtime
 SPEECHMATICS_LANGUAGE=eo
+SPEECHMATICS_AUTH_MODE=temporary_key
+SPEECHMATICS_OPERATING_POINT=standard
 ZOOM_CC_POST_URL=https://wmcc.zoom.us/closedcaption?...  # ホストが提供する URL
 ```
 
@@ -117,6 +151,7 @@ AUDIO_DEVICE_SAMPLE_RATE=48000
 AUDIO_CHUNK_DURATION_SECONDS=0.5
 AUDIO_CAPTURE_MODE=loopback
 AUDIO_AUTO_SETUP_LOOPBACK=true
+# Linuxでは録音元ではなく、聞き戻す先の物理sink名を指定
 # AUDIO_LINUX_LOOPBACK_SINK=alsa_output.pci-0000_00_1f.3.analog-stereo
 AUDIO_LEVEL_MONITOR_ENABLED=false
 AUDIO_LEVEL_SILENCE_THRESHOLD_DBFS=-45.0
@@ -192,6 +227,8 @@ DISCORD_BATCH_MAX_CHARS=350
 - `AUDIO_DEVICE_SAMPLE_RATE` にハードウェア実レート（例: 48000 Hz）を設定すると、内部で 16 kHz へ自動リサンプリングして Speechmatics/Vosk/Whisper の精度を安定させます。デバイスが 44.1 kHz 固定でもそのまま利用可能です。
 - `AUDIO_CHUNK_DURATION_SECONDS` は 0.1〜0.5 秒が推奨です。細かくするほど低遅延になりますが、CPU 負荷とネットワーク帯域が増えます。
 - `AUDIO_LEVEL_MONITOR_ENABLED=true` で入力レベル監視を有効化すると、一定時間無音（デフォルト -45 dBFS 以下が 6 秒）やクリッピングに達した場合に警告ログを出力します。閾値や検知時間は対応する `.env` 変数で微調整できます。
+- `python -m transcriber.cli --test-audio-levels 3` は、既定デバイスや `.env` を変更せずに3秒だけ録音し、無音/クリッピング/入力信号の有無を確認します。`--test-audio-profile microphone` または `loopback` を併用すると、プロファイル候補のデバイスを短時間テストできます。
+- `python -m transcriber.cli --apply-audio-profile microphone` / `loopback` は `.env` をバックアップしてから音声入力設定を切り替えます。戻す場合は `--restore-env-backup latest` を使います。
 - Linux で自動ループバックを有効にした場合、パイプライン終了時に既定の入出力デバイスを元に戻します。長時間の録音後でもシステムのサウンド設定が汚れません。
 
 ### Linux クイックガイド
@@ -200,12 +237,13 @@ DISCORD_BATCH_MAX_CHARS=350
 > 　macOS／Windows で利用する場合は、各 OS に合わせて手動でルーティングを調整してください。
 
 - **Linux (PipeWire/PulseAudio)**: `scripts/setup_audio_loopback_linux.sh` が `module-null-sink` を作成し、Monitor を既定入力に切り替えます。`run_transcriber.sh` や `python -m transcriber.cli --easy-start` から呼び出した場合は CLI 側で既定デバイスをスナップショットし、終了時に自動復元します。スクリプト単体で実行した場合は `scripts/reset_audio_defaults.sh` などで明示的に戻してください。`python -m transcriber.cli --diagnose-audio` で `pipewire` や `default` が候補に出るか確認してください。
+- Ubuntuで「イヤホンで聞きながら同じ音を文字起こしへ送る」構成の完全手順は `Ubuntu音声環境のセットアップ方法.md`、短いチェックリストは `ubuntu_loopback_ideal_state.md` にまとめています。
 - 共通: まず `python -m transcriber.cli --check-environment` で依存関係・.env・認証ファイルをチェックし、続けて `--diagnose-audio` でルーティングを確認するとスムーズです。
 - ガイド付きセットアップを見たい場合は `python -m transcriber.cli --setup-wizard` を実行すると、必須ステップと推奨ツールが一覧で表示されます。
 - マイクやスピーカーを即座に復旧したいときは `scripts/reset_audio_defaults.sh` を実行してください。
 
--停止は `Ctrl+C`。`Ctrl+Z`（ジョブの一時停止）は安全のため自動的に「終了リクエスト」に読み替えられ、ループバック設定を元に戻して停止します。旧バージョンを利用していて `Ctrl+Z` で停止してしまった場合は `fg` → `Ctrl+C` で再開・終了してください。
--ログには以下が出ます:
+- 停止は `Ctrl+C`。`Ctrl+Z`（ジョブの一時停止）は安全のため自動的に「終了リクエスト」に読み替えられ、ループバック設定を元に戻して停止します。旧バージョンを利用していて `Ctrl+Z` で停止してしまった場合は `fg` → `Ctrl+C` で再開・終了してください。
+- ログには以下が出ます:
 - `Final:` 行（Speechmatics が確定セグメントを出したタイミング）
 - Zoom への POST 成否（401/403 はトークン期限切れや会議未準備の可能性）
 - Transcript ログを有効化している場合は、確定ごとにタイムスタンプ付きで追記
@@ -242,7 +280,7 @@ Google Meet の選択肢:
 
 ## 検証と次のステップ（Validation）
 
-1. Speechmatics のハンドシェイクを検証（`start` ペイロードが最新スキーマに一致すること）。現状のビルドではカスタム辞書や `operating_point` パラメータ送信には対応していないため、必要な場合は `speechmatics_backend.py` の開始メッセージを拡張してください
+1. Speechmatics のハンドシェイクを検証（`StartRecognition` ペイロードが最新スキーマに一致すること）。`SPEECHMATICS_OPERATING_POINT=enhanced` の場合は `operating_point` を送信し、`standard` では既定モデルとして省略します。
 2. 録音済みのエスペラント音声でドライリハーサル（WER、話者分離、遅延を測定）
 3. 頻出語や固有名詞を Speechmatics の Custom Dictionary に登録。Vosk の後処理にも同語彙を反映
 4. オフライン経路を検証（Vosk モデルを用意して `--backend=vosk` で比較）
@@ -356,6 +394,16 @@ python3 scripts/diagnose_audio.py
     AUDIO_DEVICE_CHECK_INTERVAL=5.0
     # diagnose_audio.py の結果を見てデバイス固定
     AUDIO_DEVICE_INDEX=8
+    ```
+- 問題: `ModuleNotFoundError: No module named 'sounddevice'` が出る（トレースバックに `/home/.../anaconda3/lib/python3.8/runpy.py` が見える）
+  - 原因: `.venv311` を activate しても Conda 側 Python が優先され、依存解決先がずれている
+  - 解決: `.venv311` を再構築してから再度 activate
+    ```bash
+    bash scripts/setup_venv311.sh --force --non-interactive --python /usr/bin/python3.11
+    source .venv311/bin/activate
+    which python
+    python -V
+    python -c "import sounddevice, sys; print(sys.executable)"
     ```
 
 詳細は `docs/ubuntu_audio_troubleshooting.md` を参照してください。
