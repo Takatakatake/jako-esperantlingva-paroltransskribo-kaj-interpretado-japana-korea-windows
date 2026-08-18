@@ -184,7 +184,12 @@ class AudioEnvironmentManager:
 
     def _get_linux_defaults(self) -> Optional[tuple[Optional[str], Optional[str]]]:
         try:
-            output = subprocess.check_output(["pactl", "info"], text=True, stderr=subprocess.DEVNULL)
+            output = subprocess.check_output(
+                ["pactl", "info"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                env={**os.environ, "LC_ALL": "C"},
+            )
         except Exception:  # noqa: BLE001
             return None
 

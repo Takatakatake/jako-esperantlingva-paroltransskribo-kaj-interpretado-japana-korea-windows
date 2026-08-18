@@ -13,7 +13,7 @@ need pactl
 SINK_NAME="${HEADPHONE_SINK:-}"
 
 if [[ -z "$SINK_NAME" ]]; then
-  if ! def_sink_line=$(pactl info | grep -E '^Default Sink:' || true); then
+  if ! def_sink_line=$(LC_ALL=C pactl info | grep -E '^Default Sink:' || true); then
     log "could not read default sink from pactl info"
     def_sink_line=""
   fi
@@ -74,5 +74,5 @@ log "Setting default source -> ${VIRT_MONITOR}"
 pactl set-default-source "$VIRT_MONITOR"
 
 log "Now:"
-pactl info | grep -E 'Default Sink|Default Source' || true
+LC_ALL=C pactl info | grep -E 'Default Sink|Default Source' || true
 log "Complete."

@@ -242,7 +242,12 @@ def print_settings() -> None:
 
 def _capture_linux_defaults() -> Optional[tuple[Optional[str], Optional[str]]]:
     try:
-        output = subprocess.check_output(["pactl", "info"], text=True, stderr=subprocess.DEVNULL)
+        output = subprocess.check_output(
+            ["pactl", "info"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            env={**os.environ, "LC_ALL": "C"},
+        )
     except Exception:  # noqa: BLE001
         return None
 
@@ -287,7 +292,10 @@ def _list_linux_devices(kind: str) -> List[str]:
 def _ensure_linux_physical_defaults() -> None:
     try:
         info = subprocess.check_output(
-            ["pactl", "info"], text=True, stderr=subprocess.DEVNULL
+            ["pactl", "info"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            env={**os.environ, "LC_ALL": "C"},
         )
     except Exception:  # noqa: BLE001
         return
