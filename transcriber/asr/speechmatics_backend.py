@@ -27,6 +27,11 @@ class SpeechmaticsRealtimeError(TranscriptionBackendError):
         self.retryable = retryable
 
 
+# Queue sentinel: the realtime session has finished and no further
+# transcripts will arrive (EndOfTranscript received, or shutdown gave up).
+_STREAM_ENDED = object()
+
+
 class SpeechmaticsRealtimeBackend(StreamingTranscriptionBackend):
     """Manage realtime transcription sessions with Speechmatics."""
 
@@ -51,14 +56,20 @@ class SpeechmaticsRealtimeBackend(StreamingTranscriptionBackend):
         4013: ("job_error", "Speechmatics could not start the realtime job.", True),
     }
 
+    _MAX_CONSECUTIVE_RECOVERIES = 5
+
     def __init__(self, config: SpeechmaticsConfig) -> None:
         self.config = config
         self._websocket: Optional[WebSocketClientProtocol] = None
         self._listen_task: Optional[asyncio.Task[None]] = None
-        self._transcript_queue: asyncio.Queue[Optional[TranscriptSegment]] = asyncio.Queue()
+        self._transcript_queue: "asyncio.Queue[object]" = asyncio.Queue()
         self._connected = asyncio.Event()
         self._recognition_started = asyncio.Event()
         self._listener_error: Optional[SpeechmaticsRealtimeError] = None
+        self._end_of_transcript = asyncio.Event()
+        self._reconnect_guard = asyncio.Lock()
+        self._seq_no = 0
+        self._consecutive_recoveries = 0
 
     async def __aenter__(self) -> "SpeechmaticsRealtimeBackend":
         await self.connect()
@@ -72,7 +83,9 @@ class SpeechmaticsRealtimeBackend(StreamingTranscriptionBackend):
 
         self._connected.clear()
         self._recognition_started.clear()
+        self._end_of_transcript.clear()
         self._listener_error = None
+        self._seq_no = 0
         self._reset_transcript_queue()
         max_attempts = max(0, self.config.max_reconnect_attempts)
         backoff = max(self.config.reconnect_backoff_seconds, 0.1)
@@ -225,8 +238,16 @@ class SpeechmaticsRealtimeBackend(StreamingTranscriptionBackend):
 
         if self._listen_task:
             self._listen_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+            try:
                 await self._listen_task
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    # close() itself was cancelled (e.g. forced shutdown);
+                    # do not swallow that and continue running.
+                    raise
+            except Exception as exc:  # noqa: BLE001
+                logging.debug("Listener task ended with error during close: %s", exc)
             self._listen_task = None
 
         if self._websocket:
@@ -238,8 +259,38 @@ class SpeechmaticsRealtimeBackend(StreamingTranscriptionBackend):
         self._recognition_started.clear()
 
     async def send_audio_chunk(self, chunk: bytes) -> None:
-        """Send raw PCM audio bytes to the websocket."""
+        """Send raw PCM audio, transparently re-establishing a dropped session.
 
+        Retryable failures (network blips, server-side closes marked retryable)
+        trigger a reconnect instead of ending the whole pipeline; only
+        non-retryable errors or repeated back-to-back failures propagate.
+        """
+
+        try:
+            await self._send_chunk_once(chunk)
+            self._consecutive_recoveries = 0
+            return
+        except SpeechmaticsRealtimeError as exc:
+            if not exc.retryable:
+                raise
+            self._consecutive_recoveries += 1
+            if self._consecutive_recoveries > self._MAX_CONSECUTIVE_RECOVERIES:
+                raise SpeechmaticsRealtimeError(
+                    "Giving up after "
+                    f"{self._consecutive_recoveries} consecutive session recoveries: {exc}",
+                    retryable=False,
+                ) from exc
+            await self._recover_connection(exc)
+
+        try:
+            await self._send_chunk_once(chunk)
+            self._consecutive_recoveries = 0
+        except SpeechmaticsRealtimeError as exc:
+            if not exc.retryable:
+                raise
+            logging.warning("Audio chunk dropped right after reconnecting (%s).", exc)
+
+    async def _send_chunk_once(self, chunk: bytes) -> None:
         if self._listener_error is not None:
             raise self._listener_error
         if self._websocket is None or not self._connected.is_set():
@@ -258,15 +309,63 @@ class SpeechmaticsRealtimeBackend(StreamingTranscriptionBackend):
             ) from exc
         except Exception as exc:  # pylint: disable=broad-except
             raise SpeechmaticsRealtimeError(f"Failed to stream audio: {exc}") from exc
+        self._seq_no += 1
+
+    async def _recover_connection(self, reason: Exception) -> None:
+        """Re-establish the realtime session after a retryable mid-stream failure.
+
+        Always tears the session down and reconnects: several retryable
+        failures (e.g. recognition never starting) leave the connection state
+        looking healthy, so state checks cannot decide whether to skip.
+        """
+
+        async with self._reconnect_guard:
+            logging.warning("Speechmatics session lost (%s); reconnecting...", reason)
+            await self.close()
+            await self.connect()
+            logging.info("Speechmatics session re-established.")
+
+    async def finish_stream(self, timeout: float = 8.0) -> None:
+        """Ask Speechmatics to finalize trailing audio, then end the result stream.
+
+        Sends EndOfStream with the number of audio chunks delivered and waits
+        for EndOfTranscript so the last utterance still becomes a final.
+        """
+
+        websocket = self._websocket
+        if websocket is None or not self._connected.is_set():
+            await self._signal_stream_end()
+            return
+        try:
+            await websocket.send(
+                json.dumps({"message": "EndOfStream", "last_seq_no": self._seq_no})
+            )
+        except Exception as exc:  # noqa: BLE001
+            logging.debug("Failed to send EndOfStream: %s", exc)
+            await self._signal_stream_end()
+            return
+        try:
+            await asyncio.wait_for(self._end_of_transcript.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logging.warning("Timed out waiting for Speechmatics EndOfTranscript; closing anyway.")
+            await self._signal_stream_end()
+
+    async def _signal_stream_end(self) -> None:
+        await self._transcript_queue.put(_STREAM_ENDED)
 
     async def transcript_results(self) -> AsyncGenerator[TranscriptSegment, None]:
         """Yield transcript results as they arrive."""
 
         while True:
             result = await self._transcript_queue.get()
+            if result is _STREAM_ENDED:
+                return
             if result is None:
-                if self._listener_error is not None:
-                    raise self._listener_error
+                error = self._listener_error
+                if error is not None and not error.retryable:
+                    raise error
+                # Retryable failures are recovered by the audio sender; keep
+                # consuming so transcripts resume after the reconnect.
                 continue
             yield result
 
@@ -374,6 +473,11 @@ class SpeechmaticsRealtimeBackend(StreamingTranscriptionBackend):
                     transcript = self._parse_transcript(payload)
                     if transcript:
                         await self._transcript_queue.put(transcript)
+                elif msg_type == "EndOfTranscript":
+                    logging.info("Speechmatics confirmed end of transcript.")
+                    self._end_of_transcript.set()
+                    await self._transcript_queue.put(_STREAM_ENDED)
+                    break
                 elif msg_type in ("Warning",):
                     logging.warning("Speechmatics warning: %s", payload)
                 elif msg_type in ("Error", "error"):
@@ -386,12 +490,15 @@ class SpeechmaticsRealtimeBackend(StreamingTranscriptionBackend):
         except asyncio.CancelledError:
             logging.info("Speechmatics listener cancelled.")
             raise
+        except ConnectionClosed as exc:
+            error = self._connection_closed_error(exc, "Speechmatics connection closed")
+            logging.warning("%s", error)
+            await self._handle_listener_failure(error)
         except Exception as exc:  # pylint: disable=broad-except
             logging.exception("Error while listening to Speechmatics stream: %s", exc)
             await self._handle_listener_failure(
                 SpeechmaticsRealtimeError("Speechmatics listener stopped unexpectedly.")
             )
-            raise SpeechmaticsRealtimeError("Listener stopped unexpectedly.") from exc
         finally:
             self._connected.clear()
             self._recognition_started.clear()
@@ -435,7 +542,17 @@ class SpeechmaticsRealtimeBackend(StreamingTranscriptionBackend):
 
     def _reset_transcript_queue(self) -> None:
         old_queue = getattr(self, "_transcript_queue", None)
+        new_queue: "asyncio.Queue[object]" = asyncio.Queue()
         if old_queue is not None:
+            # Preserve transcripts already received but not yet consumed, so a
+            # mid-session reconnect does not silently drop delivered finals.
+            while True:
+                try:
+                    item = old_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if isinstance(item, TranscriptSegment):
+                    new_queue.put_nowait(item)
             with contextlib.suppress(asyncio.QueueFull):
                 old_queue.put_nowait(None)
-        self._transcript_queue = asyncio.Queue()
+        self._transcript_queue = new_queue

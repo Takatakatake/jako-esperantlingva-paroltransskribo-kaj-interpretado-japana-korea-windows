@@ -21,3 +21,5 @@ Thumbs.db
 # files which include important information
 
 gen-lang-client-*.json
+.env.bak.*
+.env.pre-restore.*

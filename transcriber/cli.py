@@ -520,9 +520,18 @@ async def run_pipeline(
 
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
+    run_task: Optional[asyncio.Task] = None
 
     def handle_stop(*_args):
-        logging.info("Received stop signal, shutting down.")
+        if stop_event.is_set():
+            logging.warning("Second stop signal received; forcing immediate shutdown.")
+            if run_task is not None:
+                run_task.cancel()
+            return
+        logging.info(
+            "Received stop signal; finishing trailing transcripts "
+            "(press Ctrl+C again to force quit)."
+        )
         stop_event.set()
 
     def handle_suspend(*_args):
@@ -553,12 +562,19 @@ async def run_pipeline(
         {run_task, stop_task},
         return_when=asyncio.FIRST_COMPLETED,
     )
-    if stop_task in done:
-        run_task.cancel()
+    if stop_task in done and run_task not in done:
+        pipeline.request_stop()
         try:
-            await run_task
+            await asyncio.wait_for(run_task, timeout=30.0)
+        except asyncio.TimeoutError:
+            logging.warning("Graceful shutdown timed out; cancelling the pipeline.")
+            run_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await run_task
         except asyncio.CancelledError:
             logging.info("Pipeline task cancelled.")
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Pipeline ended with an error during shutdown: %s", exc)
     else:
         stop_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):

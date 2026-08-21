@@ -449,7 +449,12 @@ class AudioChunkStream:
             raise
 
         self._stream = stream
-        self._current_device = device
+        if device is not None:
+            self._current_device = device
+        else:
+            # Store the resolved index; the change monitor compares against
+            # concrete indexes, and a stored None would mismatch forever.
+            self._current_device = self._get_default_input_device()
         self._stream_error.clear()
         self._last_chunk_time = time.time()
         logging.info("Audio stream started successfully on %s", device_name)
@@ -475,7 +480,9 @@ class AudioChunkStream:
             if candidate not in attempt_devices:
                 attempt_devices.append(candidate)
 
-        add_candidate(self._get_preferred_configured_device())
+        preferred = self._get_preferred_configured_device()
+        if preferred is not None:
+            add_candidate(preferred)
         add_candidate(device)
         if self.config.device_index is not None:
             add_candidate(self.config.device_index)
@@ -569,7 +576,7 @@ class AudioChunkStream:
                 # Check if default device changed (only if not using explicit device_index)
                 if self.config.device_index is None:
                     current_default = self._get_effective_device()
-                    if current_default != self._current_device:
+                    if current_default is not None and current_default != self._current_device:
                         logging.info(
                             "Default audio device changed from %s to %s, reconnecting...",
                             self._current_device,
@@ -643,6 +650,15 @@ class AudioChunkStream:
             except queue.Full:
                 pass
 
+    def stop(self) -> None:
+        """Stop producing chunks and wake any pending reader (idempotent)."""
+
+        self._stopped.set()
+        try:
+            self._queue.put_nowait(b"")
+        except queue.Full:
+            pass
+
     @asynccontextmanager
     async def connect(self) -> AsyncGenerator["AudioChunkStream", None]:
         """Context manager that starts and stops the underlying audio stream."""
@@ -669,7 +685,7 @@ class AudioChunkStream:
         try:
             yield self
         finally:
-            self._stopped.set()
+            self.stop()
 
             if self._monitor_task is not None:
                 self._monitor_task.cancel()
@@ -693,22 +709,38 @@ class AudioChunkStream:
     def __aiter__(self) -> "AudioChunkStream":
         return self
 
+    def _blocking_get(self) -> bytes:
+        """Wait for a chunk with a bounded timeout so a stopped stream never
+        strands the executor thread inside queue.get()."""
+
+        while True:
+            try:
+                return self._queue.get(timeout=0.25)
+            except queue.Empty:
+                if self._stopped.is_set() or self._fatal_error is not None:
+                    return b""
+
     async def next_chunk(self) -> bytes:
         """Await the next audio chunk."""
 
-        if self._fatal_error is not None:
-            raise self._fatal_error
-
         loop = asyncio.get_running_loop()
-        if self._stopped.is_set():
-            raise StopAsyncIteration
-        try:
-            chunk = await loop.run_in_executor(None, self._queue.get)
-        except Exception as exc:  # pylint: disable=broad-except
-            raise AudioCaptureError(f"Failed to read audio chunk: {exc}") from exc
-        if self._fatal_error is not None:
-            raise self._fatal_error
-        if not isinstance(chunk, (bytes, bytearray)):
-            # Defensive: ensure callers only receive raw bytes.
-            raise AudioCaptureError("Received non-bytes audio chunk from queue.")
-        return bytes(chunk)
+        while True:
+            if self._fatal_error is not None:
+                raise self._fatal_error
+            if self._stopped.is_set():
+                raise StopAsyncIteration
+            try:
+                chunk = await loop.run_in_executor(None, self._blocking_get)
+            except Exception as exc:  # pylint: disable=broad-except
+                raise AudioCaptureError(f"Failed to read audio chunk: {exc}") from exc
+            if self._fatal_error is not None:
+                raise self._fatal_error
+            if not isinstance(chunk, (bytes, bytearray)):
+                # Defensive: ensure callers only receive raw bytes.
+                raise AudioCaptureError("Received non-bytes audio chunk from queue.")
+            if not chunk:
+                # Empty bytes are wake-up sentinels, never real audio.
+                if self._stopped.is_set():
+                    raise StopAsyncIteration
+                continue
+            return bytes(chunk)

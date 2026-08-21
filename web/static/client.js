@@ -24,6 +24,7 @@
   let translationDefaultVisibility = {};
   let translationVisibility = {};
   let lastTranslations = {};
+  let lastFinalId = null;
   const historyEntries = [];
 
   function labelForLang(code) {
@@ -241,40 +242,63 @@
     return lines.join('\n');
   }
 
-  function appendToHistory(speaker, text, translations) {
+  function renderRowTranslations(row, translations) {
+    let list = row.querySelector('.history-translations');
+    if (!list) {
+      list = document.createElement('div');
+      list.className = 'history-translations';
+      row.appendChild(list);
+    }
+    list.innerHTML = '';
+    const langs = translationTargets.length
+      ? translationTargets
+      : Object.keys(translations || {});
+    langs.forEach((lang) => {
+      const value = translations?.[lang];
+      if (!value || !value.trim()) {
+        return;
+      }
+      ensureToggle(lang);
+      list.appendChild(createTranslationLine(lang, value));
+    });
+    if (!list.childElementCount) {
+      list.remove();
+    }
+  }
+
+  function appendToHistory(speaker, text, translations, entryId) {
     const row = document.createElement('div');
     row.className = 'row';
+    if (entryId != null) {
+      row.dataset.entryId = String(entryId);
+    }
 
     const original = document.createElement('div');
     original.className = 'history-original';
     original.innerHTML = `<span class="badge eo">Esperanto</span> ${speaker}${text}`;
     row.appendChild(original);
 
-    const langs = translationTargets.length
-      ? translationTargets
-      : Object.keys(translations || {});
-
-    if (langs.length) {
-      const list = document.createElement('div');
-      list.className = 'history-translations';
-      langs.forEach((lang) => {
-        const value = translations?.[lang];
-        if (!value || !value.trim()) {
-          return;
-        }
-        ensureToggle(lang);
-        const line = createTranslationLine(lang, value);
-        list.appendChild(line);
-      });
-      if (list.childElementCount) {
-        row.appendChild(list);
-      }
-    }
+    renderRowTranslations(row, translations);
 
     historyEl.prepend(row);
-    historyEntries.push(formatHistoryEntry(speaker, text, translations));
+    historyEntries.push({ id: entryId ?? null, speaker, text, translations: translations || {} });
     trimHistory();
     applyAllVisibility();
+  }
+
+  function updateEntryTranslations(entryId, translations) {
+    if (entryId == null) {
+      return;
+    }
+    const entry = historyEntries.find((e) => e.id === entryId);
+    if (entry) {
+      entry.translations = translations || {};
+    }
+    const row = historyEl.querySelector(`[data-entry-id="${entryId}"]`);
+    if (row) {
+      renderRowTranslations(row, translations || {});
+      applyAllVisibility();
+    }
   }
 
   function trimHistory() {
@@ -290,9 +314,17 @@
     historyEl.innerHTML = '';
   }
 
+  function formattedHistoryText() {
+    return historyEntries
+      .slice()
+      .reverse()
+      .map((e) => formatHistoryEntry(e.speaker, e.text, e.translations))
+      .join('\n\n');
+  }
+
   function copyHistory() {
     if (!historyEntries.length) return;
-    const text = historyEntries.slice().reverse().join('\n\n');
+    const text = formattedHistoryText();
     navigator.clipboard
       .writeText(text)
       .then(() => {
@@ -303,7 +335,7 @@
 
   function downloadHistory() {
     if (!historyEntries.length) return;
-    const blob = new Blob([historyEntries.slice().reverse().join('\n\n')], {
+    const blob = new Blob([formattedHistoryText()], {
       type: 'text/plain;charset=utf-8',
     });
     const url = URL.createObjectURL(blob);
@@ -322,7 +354,18 @@
     const wsUrl = `${protocol}://${location.host}/ws`;
     const ws = new WebSocket(wsUrl);
 
-    ws.onopen = () => console.log('[WS] connected');
+    ws.onopen = () => {
+      console.log('[WS] connected');
+      // A restarted server reuses caption ids from 1; detach existing rows so
+      // late translation updates cannot attach to the wrong entry.
+      lastFinalId = null;
+      historyEl.querySelectorAll('[data-entry-id]').forEach((el) => {
+        delete el.dataset.entryId;
+      });
+      historyEntries.forEach((entry) => {
+        entry.id = null;
+      });
+    };
     ws.onclose = () => {
       console.log('[WS] closed, retrying...');
       setTimeout(connectWebSocket, 1500);
@@ -338,11 +381,17 @@
         } else if (msg.type === 'final') {
           const text = (msg.text || '').trim();
           finalEl.textContent = speakerPrefix + text;
+          lastFinalId = typeof msg.id === 'number' ? msg.id : null;
           renderFinalTranslations(msg.translations || {});
           if (text) {
-            appendToHistory(speakerPrefix, text, msg.translations || {});
+            appendToHistory(speakerPrefix, text, msg.translations || {}, lastFinalId);
           }
           partialEl.textContent = '';
+        } else if (msg.type === 'translation') {
+          if (typeof msg.id === 'number' && msg.id === lastFinalId) {
+            renderFinalTranslations(msg.translations || {});
+          }
+          updateEntryTranslations(typeof msg.id === 'number' ? msg.id : null, msg.translations || {});
         }
       } catch (err) {
         console.warn('Invalid WS payload', err);
