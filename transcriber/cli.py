@@ -258,6 +258,12 @@ def _capture_linux_defaults() -> Optional[tuple[Optional[str], Optional[str]]]:
             sink = line.split(":", 1)[1].strip() or None
         elif line.startswith("Default Source:"):
             source = line.split(":", 1)[1].strip() or None
+    # A leftover virtual sink from an unclean exit must never become the
+    # restore target or the HEADPHONE_SINK hint.
+    if sink and sink.startswith("codex_transcribe"):
+        sink = None
+    if source and source.startswith("codex_transcribe"):
+        source = None
     if sink or source:
         return sink, source
     return None
@@ -386,6 +392,7 @@ def run_easy_start(
     defaults_before_script: Optional[tuple[Optional[str], Optional[str]]] = None
     modules_before_script: Optional[Dict[str, Set[str]]] = None
     modules_to_unload: Dict[str, Set[str]] = {"null": set(), "loop": set()}
+    setup_ran = False
 
     if system == "linux":
         script_path = scripts_dir / "setup_audio_loopback_linux.sh"
@@ -441,6 +448,7 @@ def run_easy_start(
         if run_setup:
             try:
                 subprocess.run(command, check=True)
+                setup_ran = True
                 if system == "linux":
                     modules_after = _snapshot_linux_modules()
                     if modules_before_script is None:
@@ -471,7 +479,10 @@ def run_easy_start(
     loopback_flag_previous: Optional[str] = None
     if start_now:
         try:
-            if system == "linux":
+            if system == "linux" and setup_ran:
+                # Only advertise a prepared loopback when the setup script
+                # actually ran; otherwise the pipeline must do its own setup
+                # instead of silently capturing the microphone.
                 if defaults_before_script:
                     sink_hint = defaults_before_script[0]
                     if sink_hint:
@@ -484,14 +495,15 @@ def run_easy_start(
             if defaults_before_script:
                 _restore_linux_defaults(defaults_before_script)
             if system == "linux":
-                if headphone_env_previous is not None:
-                    os.environ["HEADPHONE_SINK"] = headphone_env_previous
-                else:
-                    os.environ.pop("HEADPHONE_SINK", None)
-                if loopback_flag_previous is not None:
-                    os.environ["AUDIO_LOOPBACK_ALREADY_SET"] = loopback_flag_previous
-                else:
-                    os.environ.pop("AUDIO_LOOPBACK_ALREADY_SET", None)
+                if setup_ran:
+                    if headphone_env_previous is not None:
+                        os.environ["HEADPHONE_SINK"] = headphone_env_previous
+                    else:
+                        os.environ.pop("HEADPHONE_SINK", None)
+                    if loopback_flag_previous is not None:
+                        os.environ["AUDIO_LOOPBACK_ALREADY_SET"] = loopback_flag_previous
+                    else:
+                        os.environ.pop("AUDIO_LOOPBACK_ALREADY_SET", None)
                 _unload_linux_modules(modules_to_unload)
                 _ensure_linux_physical_defaults()
     else:
@@ -775,7 +787,8 @@ def main() -> None:
         return
 
     if args.easy_start:
-        run_easy_start(args.backend, args.log_file)
+        if not run_easy_start(args.backend, args.log_file):
+            raise SystemExit(1)
         return
 
     run_pipeline_command(args.backend, args.log_file)

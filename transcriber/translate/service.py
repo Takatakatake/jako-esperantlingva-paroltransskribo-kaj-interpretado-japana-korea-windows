@@ -45,7 +45,9 @@ class TranslationService:
     ) -> None:
         self.enabled = enabled and bool(targets)
         self.source_language = source_language
-        self.targets = list(targets or [])
+        # Deduplicate while keeping order; duplicate TRANSLATION_TARGETS
+        # entries would spawn redundant requests and break cache completeness.
+        self.targets = list(dict.fromkeys(targets or []))
         self.provider = provider
         self.libre_url = libre_url.rstrip("/")
         self.libre_api_key = libre_api_key
@@ -141,7 +143,10 @@ class TranslationService:
                     logging.error("Translation to %s failed: %s", target, result)
                 elif result:
                     translations[target] = result
-            self._store_cache(key, translations)
+            if translations and set(self.targets) <= set(translations):
+                # Cache only complete results; caching a failure would pin the
+                # missing translation for every repeat of the same sentence.
+                self._store_cache(key, translations)
 
         return TranslationResult(text=text, translations=translations)
 

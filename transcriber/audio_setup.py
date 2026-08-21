@@ -48,6 +48,24 @@ class AudioDiagnosticReport:
     recommendations: List[str]
 
 
+def _sanitize_restore_defaults(
+    defaults: Optional[tuple[Optional[str], Optional[str]]],
+) -> Optional[tuple[Optional[str], Optional[str]]]:
+    """Drop leftover virtual-sink values: restoring them would re-pin the
+    codex_transcribe routing after an unclean previous exit."""
+
+    if not defaults:
+        return None
+    sink, source = defaults
+    if sink and sink.startswith("codex_transcribe"):
+        sink = None
+    if source and source.startswith("codex_transcribe"):
+        source = None
+    if sink or source:
+        return (sink, source)
+    return None
+
+
 class AudioEnvironmentManager:
     """Prepare platform-specific audio routing based on configuration."""
 
@@ -66,20 +84,21 @@ class AudioEnvironmentManager:
 
         self._cleanup_actions.clear()
 
-        self._ensure_device_presence()
+        try:
+            self._ensure_device_presence()
 
-        if mode is AudioCaptureMode.MICROPHONE:
-            return
-
-        if mode is AudioCaptureMode.API:
-            logging.info(
-                "Audio capture mode set to 'api'. Ensure external media ingestion is configured."
-            )
-            return
-
-        if mode is AudioCaptureMode.LOOPBACK:
-            self._prepare_loopback()
-            return
+            if mode is AudioCaptureMode.API:
+                logging.info(
+                    "Audio capture mode set to 'api'. Ensure external media ingestion is configured."
+                )
+            elif mode is AudioCaptureMode.LOOPBACK:
+                self._prepare_loopback()
+        except Exception:
+            # Roll back routing changes made before the failure; otherwise the
+            # system stays half-configured (e.g. default sink already switched
+            # to the virtual sink) with no one left to restore it.
+            self.cleanup()
+            raise
 
     def cleanup(self) -> None:
         """Rollback any environment changes performed during prepare()."""
@@ -145,14 +164,26 @@ class AudioEnvironmentManager:
         capture_defaults: Optional[tuple[Optional[str], Optional[str]]] = None
         if os.environ.get("AUDIO_LOOPBACK_ALREADY_SET") == "1":
             logging.debug("Loopback already set by launcher; verifying availability only.")
-            if self._config.device_index is None and not self._detect_loopback_candidate({"monitor", "loopback"}):
-                raise AudioEnvironmentError(
-                    "Loopback auto-setup flag set but no monitor source detected."
-                )
+            if self._config.device_index is None:
+                defaults = self._get_linux_defaults()
+                source = defaults[1] if defaults else None
+                if source:
+                    # PortAudio cannot tell monitors apart, but pactl can:
+                    # require that the default source really is a monitor.
+                    if not source.endswith(".monitor"):
+                        raise AudioEnvironmentError(
+                            "AUDIO_LOOPBACK_ALREADY_SET=1 but the default source "
+                            f"({source}) is not a monitor. Run "
+                            "scripts/setup_audio_loopback_linux.sh or unset the flag."
+                        )
+                elif not self._detect_loopback_candidate({"monitor", "loopback"}):
+                    raise AudioEnvironmentError(
+                        "Loopback auto-setup flag set but no monitor source detected."
+                    )
             return
 
         if self._config.auto_setup_loopback:
-            capture_defaults = self._get_linux_defaults()
+            capture_defaults = _sanitize_restore_defaults(self._get_linux_defaults())
             if capture_defaults:
                 self._register_linux_defaults_restore(capture_defaults)
 

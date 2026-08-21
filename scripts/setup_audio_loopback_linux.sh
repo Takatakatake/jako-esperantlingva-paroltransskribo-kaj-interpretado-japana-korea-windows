@@ -49,6 +49,29 @@ if [[ -z "$SINK_NAME" ]]; then
   fi
 fi
 
+if [[ "$SINK_NAME" == codex_transcribe* ]]; then
+  # A leftover virtual sink from an unclean exit must never become the
+  # playback target: looping its monitor into itself creates echo feedback.
+  log "Refusing leftover virtual sink '$SINK_NAME' as the playback target."
+  mapfile -t phys_sinks < <(pactl list short sinks | awk '{print $2}' | grep -v '^codex_transcribe' || true)
+  fallback=""
+  for candidate in "${phys_sinks[@]}"; do
+    if [[ "$candidate" == alsa_output* ]]; then
+      fallback="$candidate"
+      break
+    fi
+  done
+  if [[ -z "$fallback" && ${#phys_sinks[@]} -gt 0 && -n "${phys_sinks[0]}" ]]; then
+    fallback="${phys_sinks[0]}"
+  fi
+  if [[ -z "$fallback" ]]; then
+    log "No physical sink available to fall back to; aborting."
+    exit 1
+  fi
+  SINK_NAME="$fallback"
+  log "Falling back to physical sink: $SINK_NAME"
+fi
+
 log "Using headphone/output sink: $SINK_NAME"
 
 VIRT_SINK_NAME=codex_transcribe

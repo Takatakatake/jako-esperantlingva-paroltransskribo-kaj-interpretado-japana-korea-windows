@@ -205,3 +205,76 @@ class EnvCheckTests(unittest.TestCase):
         mock_ensure_phys.assert_called()
         self.assertNotIn("AUDIO_LOOPBACK_ALREADY_SET", os.environ)
         self.assertNotIn("HEADPHONE_SINK", os.environ)
+
+    @mock.patch("transcriber.cli._ensure_linux_physical_defaults")
+    @mock.patch("transcriber.cli.subprocess.run")
+    @mock.patch("transcriber.cli._unload_linux_modules")
+    @mock.patch(
+        "transcriber.cli._snapshot_linux_modules",
+        return_value={"null": set(), "loop": set()},
+    )
+    @mock.patch("transcriber.cli._restore_linux_defaults")
+    @mock.patch("transcriber.cli._capture_linux_defaults", return_value=("alsa_output.pci-0000_00_1f.3.analog-stereo", "alsa_input.pci-0000_00_1f.3.analog-stereo"))
+    @mock.patch("transcriber.cli.run_pipeline")
+    @mock.patch("transcriber.cli.run_environment_check", return_value=True)
+    @mock.patch("transcriber.cli.load_settings")
+    @mock.patch("transcriber.cli.run_cli_diagnostics")
+    @mock.patch("platform.system", return_value="Linux")
+    def test_easy_start_declined_setup_leaves_loopback_flag_unset(
+        self,
+        mock_platform,
+        mock_run_cli_diagnostics,
+        mock_load_settings,
+        mock_run_env_check,
+        mock_run_pipeline,
+        mock_capture_linux_defaults,
+        mock_restore_linux_defaults,
+        mock_snapshot_linux_modules,
+        mock_unload_linux_modules,
+        mock_subprocess_run,
+        mock_ensure_phys,
+    ) -> None:
+        """Declining the loopback setup must not advertise a prepared loopback:
+        the flag would make the pipeline skip auto-setup and capture the mic."""
+
+        mock_load_settings.return_value = SimpleNamespace(audio="stub")
+        seen_env: dict[str, str | None] = {}
+
+        async def fake_pipeline(*args, **kwargs):
+            seen_env["flag"] = os.environ.get("AUDIO_LOOPBACK_ALREADY_SET")
+            seen_env["headphone"] = os.environ.get("HEADPHONE_SINK")
+
+        mock_run_pipeline.side_effect = fake_pipeline
+
+        stdin = SimpleNamespace(isatty=lambda: True)
+        with mock.patch("transcriber.cli.sys.stdin", stdin), mock.patch(
+            "builtins.input", side_effect=["n", "y"]
+        ), mock.patch.dict(os.environ, {}, clear=True):
+            result = run_easy_start()
+
+        self.assertTrue(result)
+        mock_subprocess_run.assert_not_called()
+        self.assertIsNone(seen_env["flag"])
+        self.assertIsNone(seen_env["headphone"])
+
+
+class CaptureLinuxDefaultsTests(unittest.TestCase):
+    def test_leftover_virtual_defaults_are_filtered(self) -> None:
+        from transcriber.cli import _capture_linux_defaults
+
+        output = "Default Sink: codex_transcribe\nDefault Source: codex_transcribe.monitor\n"
+        with mock.patch(
+            "transcriber.cli.subprocess.check_output", return_value=output
+        ):
+            self.assertIsNone(_capture_linux_defaults())
+
+    def test_physical_defaults_pass_through(self) -> None:
+        from transcriber.cli import _capture_linux_defaults
+
+        output = "Default Sink: alsa_output.analog\nDefault Source: alsa_input.analog\n"
+        with mock.patch(
+            "transcriber.cli.subprocess.check_output", return_value=output
+        ):
+            self.assertEqual(
+                _capture_linux_defaults(), ("alsa_output.analog", "alsa_input.analog")
+            )

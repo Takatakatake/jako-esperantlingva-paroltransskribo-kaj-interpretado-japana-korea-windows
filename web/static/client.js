@@ -43,6 +43,9 @@
   }
 
   const settings = loadSettings();
+  // Seed visibility from storage right away: the init-time saveSettings()
+  // calls would otherwise persist an empty object before /config loads.
+  translationVisibility = { ...(settings.translationVisibility || {}) };
 
   function saveSettings() {
     const payload = {
@@ -120,7 +123,12 @@
   }
 
   function initTranslationVisibility() {
-    translationVisibility = {};
+    // Merge instead of reset: a failed /config fetch (empty targets) must not
+    // wipe stored per-language choices before the next saveSettings() call.
+    translationVisibility = {
+      ...(settings.translationVisibility || {}),
+      ...translationVisibility,
+    };
     translationTargets.forEach((lang) => {
       translationVisibility[lang] = initialVisibilityFor(lang);
     });

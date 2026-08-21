@@ -344,13 +344,16 @@ PipeWire/WirePlumber が既定入力を物理マイクに戻してしまうと�
 
 ```bash
 install -Dm755 scripts/wp-force-monitor.sh ~/bin/wp-force-monitor.sh
-~/bin/wp-force-monitor.sh                           # 初回: アナログ monitor を強制
+~/bin/wp-force-monitor.sh                           # 初回実行（monitor を自動選択して固定）
 cp systemd/wp-force-monitor.{service,path} ~/.config/systemd/user/
 systemctl --user daemon-reload
-systemctl --user enable --now wp-force-monitor.service wp-force-monitor.path
+systemctl --user enable --now wp-force-monitor.path  # 監視は .path のみ有効化
+systemctl --user start wp-force-monitor.service      # 必要なら今すぐ 1 回実行
 ```
 
-`wp-force-monitor` は既定ソースを `alsa_output...analog-stereo.monitor` に固定します（Discord/Speechmatics が常に Meet ループバックを聴ける）。`SINK_NAME=...` を渡さない限り既定シンクはユーザー操作で可変です。
+`wp-force-monitor` は既定ソースを monitor に固定します（`SOURCE_NAME` 未指定時は `codex_transcribe.monitor`、無ければ現在の既定シンクの monitor を自動選択）。`SINK_NAME=...` を渡さない限り既定シンクはユーザー操作で可変です。
+
+> ⚠️ **併用注意**: `python -m transcriber.cli` の自動ループバック構成（`codex_transcribe` を作成し、終了時に元へ復元）を使う場合、この systemd ユニットは**有効化しないでください**。ユニットが既定ソースを強制的に書き戻し、CLI 側の設定・復元と競合します。CLI の自動構成だけで通常運用は十分です。
 
 ---
 

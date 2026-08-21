@@ -341,13 +341,16 @@ PipeWire/WirePlumber occasionally revert the default input to a hardware mic. To
 
 ```bash
 install -Dm755 scripts/wp-force-monitor.sh ~/bin/wp-force-monitor.sh
-~/bin/wp-force-monitor.sh                           # once: force analog monitor
+~/bin/wp-force-monitor.sh                           # once: pin an auto-selected monitor source
 cp systemd/wp-force-monitor.{service,path} ~/.config/systemd/user/
 systemctl --user daemon-reload
-systemctl --user enable --now wp-force-monitor.service wp-force-monitor.path
+systemctl --user enable --now wp-force-monitor.path  # enable only the watcher
+systemctl --user start wp-force-monitor.service      # optional immediate run
 ```
 
-`wp-force-monitor` keeps the default source on `alsa_output...analog-stereo.monitor`. Provide `SINK_NAME=...` only if you also want to pin the sink.
+`wp-force-monitor` pins the default source to a monitor (`codex_transcribe.monitor` when that sink exists, otherwise the current default sink's monitor; override with `SOURCE_NAME=...`). Provide `SINK_NAME=...` only if you also want to pin the sink.
+
+> ⚠️ **Do not enable these systemd units while using the CLI's automatic loopback setup** (`python -m transcriber.cli` creates `codex_transcribe` and restores your defaults on exit); the unit would keep forcing the default source back and fight the CLI's setup/restore.
 
 ---
 
