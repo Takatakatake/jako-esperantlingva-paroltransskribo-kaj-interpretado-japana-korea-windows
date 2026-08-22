@@ -110,7 +110,10 @@ class TranscriptFileLogger:
 
     def __enter__(self) -> "TranscriptFileLogger":
         path = self._resolved_path
-        should_enable = self._settings.enabled or path is not None
+        # An explicit --log-file override always logs; otherwise honor the
+        # configured enabled flag (TRANSCRIPT_LOG_ENABLED=false wins even
+        # when TRANSCRIPT_LOG_PATH is set).
+        should_enable = bool(self._override_path) or self._settings.enabled
         if not should_enable or path is None:
             return self
 
@@ -168,6 +171,7 @@ class TranscriptionPipeline:
         self._caption_seq = 0
         self._translation_queue: Optional[asyncio.Queue] = None
         self._translation_worker: Optional[asyncio.Task] = None
+        self._routing_watchdog: Optional[asyncio.Task] = None
         self._sentence_assembler = SentenceAssembler()
         self._discord_notifier = DiscordNotifier(
             webhook_url=self.settings.discord.webhook_url,
@@ -225,6 +229,9 @@ class TranscriptionPipeline:
             self._translation_worker = asyncio.create_task(
                 self._translation_worker_loop(), name="translation-worker"
             )
+        self._routing_watchdog = asyncio.create_task(
+            self._routing_watchdog_loop(), name="routing-watchdog"
+        )
         try:
             with self._transcript_logger:
                 async with self._zoom_publisher:
@@ -284,6 +291,7 @@ class TranscriptionPipeline:
                 except Exception as exc:  # noqa: BLE001
                     logging.exception("Cleanup step %s failed: %s", label, exc)
 
+            await _cleanup_step(self._stop_routing_watchdog, "routing-watchdog")
             await _cleanup_step(self._flush_pending_sentences, "flush-pending-sentences")
             await _cleanup_step(self._stop_translation_worker, "translation-worker")
             if self._web_ui:
@@ -512,6 +520,26 @@ class TranscriptionPipeline:
         except Exception as exc:  # noqa: BLE001
             logging.error("Translation failed: %s", exc)
         return {}
+
+    async def _routing_watchdog_loop(self) -> None:
+        """Periodically re-pin the default input if the OS moved it mid-call
+        (Bluetooth headset connecting, sound-settings changes, WirePlumber)."""
+
+        loop = asyncio.get_running_loop()
+        while True:
+            await asyncio.sleep(5.0)
+            try:
+                await loop.run_in_executor(None, self._audio_env.enforce_default_source)
+            except Exception as exc:  # noqa: BLE001
+                logging.debug("Routing watchdog check failed: %s", exc)
+
+    async def _stop_routing_watchdog(self) -> None:
+        if self._routing_watchdog is None:
+            return
+        self._routing_watchdog.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await self._routing_watchdog
+        self._routing_watchdog = None
 
     async def _stop_translation_worker(self) -> None:
         if self._translation_worker is None:

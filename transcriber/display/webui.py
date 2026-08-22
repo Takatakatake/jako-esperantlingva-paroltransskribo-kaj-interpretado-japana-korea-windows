@@ -6,6 +6,7 @@ import logging
 import errno
 from pathlib import Path
 from typing import Dict, List, Optional, Set
+from urllib.parse import urlparse
 
 from aiohttp import web, WSMsgType
 
@@ -99,7 +100,38 @@ class CaptionWebUI:
     async def _handle_config(self, request: web.Request) -> web.Response:
         return web.json_response(self._config_payload)
 
+    def _origin_allowed(self, request: web.Request) -> bool:
+        """WebSockets bypass the same-origin policy, so reject upgrades from
+        foreign web pages; otherwise any site open in the user's browser
+        could read the live transcript. Absent Origin (curl, native tools)
+        is allowed."""
+
+        origin = request.headers.get("Origin")
+        if not origin:
+            return True
+        try:
+            parsed = urlparse(origin)
+            port = parsed.port  # may raise ValueError on malformed ports
+        except ValueError:
+            return False
+        if parsed.scheme not in {"http", "https"}:
+            return False
+        host = (parsed.hostname or "").lower()
+        bind = self.host.lower()
+        wildcard_bind = bind in {"0.0.0.0", "::", ""}
+        if not wildcard_bind and host not in {"127.0.0.1", "localhost", "::1", bind}:
+            return False
+        if port is None:
+            port = 443 if parsed.scheme == "https" else 80
+        return port == self.port
+
     async def _handle_ws(self, request: web.Request) -> web.StreamResponse:
+        if not self._origin_allowed(request):
+            logging.warning(
+                "Rejected WebSocket connection from foreign origin: %s",
+                request.headers.get("Origin"),
+            )
+            raise web.HTTPForbidden(text="Origin not allowed")
         ws = web.WebSocketResponse(heartbeat=20)
         await ws.prepare(request)
         self._clients.add(ws)

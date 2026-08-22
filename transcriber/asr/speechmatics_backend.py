@@ -56,7 +56,10 @@ class SpeechmaticsRealtimeBackend(StreamingTranscriptionBackend):
         4013: ("job_error", "Speechmatics could not start the realtime job.", True),
     }
 
-    _MAX_CONSECUTIVE_RECOVERIES = 5
+    # Each failed recovery cycle spends ~20s inside connect()'s own retries,
+    # so 8 cycles tolerate roughly 2-3 minutes of network outage
+    # (suspend/resume, router reboot) before giving up for good.
+    _MAX_CONSECUTIVE_RECOVERIES = 8
 
     def __init__(self, config: SpeechmaticsConfig) -> None:
         self.config = config
@@ -280,7 +283,21 @@ class SpeechmaticsRealtimeBackend(StreamingTranscriptionBackend):
                     f"{self._consecutive_recoveries} consecutive session recoveries: {exc}",
                     retryable=False,
                 ) from exc
-            await self._recover_connection(exc)
+            try:
+                await self._recover_connection(exc)
+            except SpeechmaticsRealtimeError as recover_exc:
+                if not recover_exc.retryable:
+                    raise
+                # The network may still be down (suspend/resume, router
+                # reboot). Drop this chunk and keep the session alive; the
+                # next chunk retries recovery, bounded by the counter above.
+                logging.warning(
+                    "Session recovery %d/%d failed (%s); will retry on the next chunk.",
+                    self._consecutive_recoveries,
+                    self._MAX_CONSECUTIVE_RECOVERIES,
+                    recover_exc,
+                )
+                return
 
         try:
             await self._send_chunk_once(chunk)

@@ -115,6 +115,60 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "SPEECHMATICS_AUTH_MODE"):
                 load_settings()
 
+    @mock.patch("transcriber.config.load_dotenv", return_value=None)
+    def test_explicit_translation_disabled_wins_over_targets(self, _mock_load_dotenv) -> None:
+        env = {
+            "SPEECHMATICS_API_KEY": "sk_test_1234567890",
+            "TRANSLATION_ENABLED": "false",
+            "TRANSLATION_TARGETS": "ja,ko",
+        }
+
+        with mock.patch.dict(os.environ, env, clear=True):
+            load_settings.cache_clear()
+            settings = load_settings()
+
+        self.assertFalse(settings.translation.enabled)
+
+    @mock.patch("transcriber.config.load_dotenv", return_value=None)
+    def test_translation_targets_imply_enabled_when_flag_unset(self, _mock_load_dotenv) -> None:
+        env = {
+            "SPEECHMATICS_API_KEY": "sk_test_1234567890",
+            "TRANSLATION_TARGETS": "ja,ko",
+        }
+
+        with mock.patch.dict(os.environ, env, clear=True):
+            load_settings.cache_clear()
+            settings = load_settings()
+
+        self.assertTrue(settings.translation.enabled)
+
+    @mock.patch("transcriber.config.load_dotenv", return_value=None)
+    def test_explicit_transcript_log_disabled_wins_over_path(self, _mock_load_dotenv) -> None:
+        env = {
+            "SPEECHMATICS_API_KEY": "sk_test_1234567890",
+            "TRANSCRIPT_LOG_ENABLED": "false",
+            "TRANSCRIPT_LOG_PATH": "logs/session.log",
+        }
+
+        with mock.patch.dict(os.environ, env, clear=True):
+            load_settings.cache_clear()
+            settings = load_settings()
+
+        self.assertFalse(settings.logging.enabled)
+
+    @mock.patch("transcriber.config.load_dotenv", return_value=None)
+    def test_transcript_log_path_implies_enabled_when_flag_unset(self, _mock_load_dotenv) -> None:
+        env = {
+            "SPEECHMATICS_API_KEY": "sk_test_1234567890",
+            "TRANSCRIPT_LOG_PATH": "logs/session.log",
+        }
+
+        with mock.patch.dict(os.environ, env, clear=True):
+            load_settings.cache_clear()
+            settings = load_settings()
+
+        self.assertTrue(settings.logging.enabled)
+
 
 if __name__ == "__main__":
     unittest.main()

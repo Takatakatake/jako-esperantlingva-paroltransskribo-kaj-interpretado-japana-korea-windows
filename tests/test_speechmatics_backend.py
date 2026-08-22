@@ -213,6 +213,52 @@ class SpeechmaticsSessionRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(ctx.exception.retryable)
         self.assertEqual(recoveries, [])
 
+    async def test_failed_recovery_drops_chunk_but_keeps_session_alive(self) -> None:
+        """A network outage longer than one connect() cycle (suspend/resume)
+        must not kill the pipeline on the first failed reconnect."""
+
+        backend = _make_backend()
+        recover_calls: list[int] = []
+
+        async def fake_send_once(chunk: bytes) -> None:
+            raise SpeechmaticsRealtimeError("Connection is not established.", retryable=True)
+
+        async def failing_recover(reason: Exception) -> None:
+            recover_calls.append(1)
+            raise SpeechmaticsRealtimeError(
+                "Failed to connect to Speechmatics after 4 attempts.", retryable=True
+            )
+
+        backend._send_chunk_once = fake_send_once  # type: ignore[method-assign]
+        backend._recover_connection = failing_recover  # type: ignore[method-assign]
+
+        # Each chunk triggers one failed recovery, silently, up to the cap.
+        for _ in range(backend._MAX_CONSECUTIVE_RECOVERIES):
+            await backend.send_audio_chunk(b"pcm")
+
+        with self.assertRaises(SpeechmaticsRealtimeError) as ctx:
+            await backend.send_audio_chunk(b"pcm")
+
+        self.assertFalse(ctx.exception.retryable)
+        self.assertEqual(len(recover_calls), backend._MAX_CONSECUTIVE_RECOVERIES)
+
+    async def test_non_retryable_recovery_failure_propagates(self) -> None:
+        backend = _make_backend()
+
+        async def fake_send_once(chunk: bytes) -> None:
+            raise SpeechmaticsRealtimeError("blip", retryable=True)
+
+        async def fatal_recover(reason: Exception) -> None:
+            raise SpeechmaticsRealtimeError("quota gone", retryable=False)
+
+        backend._send_chunk_once = fake_send_once  # type: ignore[method-assign]
+        backend._recover_connection = fatal_recover  # type: ignore[method-assign]
+
+        with self.assertRaises(SpeechmaticsRealtimeError) as ctx:
+            await backend.send_audio_chunk(b"pcm")
+
+        self.assertFalse(ctx.exception.retryable)
+
     async def test_send_gives_up_after_too_many_consecutive_recoveries(self) -> None:
         backend = _make_backend()
         backend._consecutive_recoveries = backend._MAX_CONSECUTIVE_RECOVERIES

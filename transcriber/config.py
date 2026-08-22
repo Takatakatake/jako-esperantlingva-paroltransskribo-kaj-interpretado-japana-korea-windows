@@ -212,6 +212,19 @@ def _blank_to_none(value: Optional[str]) -> Optional[str]:
     return cleaned or None
 
 
+def _flag_with_implicit_default(env: Mapping[str, str], name: str, implicit: bool) -> bool:
+    """Boolean env flag where an explicit value always wins.
+
+    Only when the variable is unset (or blank) does the implicit default
+    apply — so e.g. TRANSLATION_ENABLED=false disables translation even when
+    TRANSLATION_TARGETS is configured."""
+
+    raw = _blank_to_none(env.get(name))
+    if raw is None:
+        return implicit
+    return raw.lower() in {"1", "true", "yes"}
+
+
 def _optional_int(env: Mapping[str, str], name: str) -> Optional[int]:
     value = _blank_to_none(env.get(name))
     if value is None:
@@ -318,8 +331,9 @@ def load_settings() -> Settings:
             whisper_cfg = WhisperConfig()
 
         logging_cfg = TranscriptLoggingConfig(
-            enabled=env.get("TRANSCRIPT_LOG_ENABLED", "false").lower() in {"1", "true", "yes"}
-            or bool(env.get("TRANSCRIPT_LOG_PATH")),
+            enabled=_flag_with_implicit_default(
+                env, "TRANSCRIPT_LOG_ENABLED", implicit=bool(env.get("TRANSCRIPT_LOG_PATH"))
+            ),
             file_path=env.get("TRANSCRIPT_LOG_PATH"),
             include_timestamps=env.get("TRANSCRIPT_LOG_WITH_TIMESTAMPS", "true").lower()
             in {"1", "true", "yes"},
@@ -352,8 +366,9 @@ def load_settings() -> Settings:
                         translation_visibility[lang] = True
 
         translation_cfg = TranslationConfig(
-            enabled=env.get("TRANSLATION_ENABLED", "false").lower() in {"1", "true", "yes"}
-            or bool(translation_targets),
+            enabled=_flag_with_implicit_default(
+                env, "TRANSLATION_ENABLED", implicit=bool(translation_targets)
+            ),
             source_language=env.get("TRANSLATION_SOURCE_LANGUAGE", env.get("SPEECHMATICS_LANGUAGE", "eo")),
             targets=translation_targets,
             provider=env.get("TRANSLATION_PROVIDER", "libre"),

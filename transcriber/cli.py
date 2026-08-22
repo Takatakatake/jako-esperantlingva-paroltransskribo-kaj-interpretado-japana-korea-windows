@@ -594,10 +594,51 @@ async def run_pipeline(
         await run_task
 
 
+def _acquire_instance_lock(lock_path: Optional[Path] = None):
+    """User-wide single-instance lock.
+
+    Two pipelines would fight over the PipeWire default devices (the first
+    one to exit rewires audio underneath the survivor), so refuse to start a
+    second instance. Returns the held file object; closing it releases the
+    lock. Returns None on platforms without flock.
+    """
+
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - non-POSIX
+        return None
+
+    if lock_path is None:
+        lock_path = Path.home() / ".cache" / "esperanto-transcriber.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(lock_path, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.seek(0)
+        other_pid = handle.read().strip() or "unknown"
+        handle.close()
+        print(
+            "別の文字起こしプロセスが既に実行中です "
+            f"(PID: {other_pid})。多重起動は音声ルーティングを壊すため中止します。"
+        )
+        print("既存のセッションを Ctrl+C で終了してから再実行してください。")
+        raise SystemExit(1) from None
+    handle.truncate(0)
+    handle.write(str(os.getpid()))
+    handle.flush()
+    return handle
+
+
 def run_pipeline_command(
     backend_override: Optional[str] = None, log_file_override: Optional[str] = None
 ) -> None:
-    """Run the pipeline and report expected runtime failures without a traceback."""
+    """Run the pipeline and report expected runtime failures without a traceback.
+
+    The single-instance lock is acquired by main() before dispatch (also
+    covering the easy-start flow, whose refusal path must not touch audio
+    routing); acquiring it again here would deadlock against our own fd.
+    """
 
     try:
         asyncio.run(run_pipeline(backend_override, log_file_override))
@@ -787,11 +828,21 @@ def main() -> None:
         return
 
     if args.easy_start:
-        if not run_easy_start(args.backend, args.log_file):
-            raise SystemExit(1)
+        lock = _acquire_instance_lock()
+        try:
+            if not run_easy_start(args.backend, args.log_file):
+                raise SystemExit(1)
+        finally:
+            if lock is not None:
+                lock.close()
         return
 
-    run_pipeline_command(args.backend, args.log_file)
+    lock = _acquire_instance_lock()
+    try:
+        run_pipeline_command(args.backend, args.log_file)
+    finally:
+        if lock is not None:
+            lock.close()
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ import os
 import platform
 import shutil
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, List, Optional, Sequence, Tuple
@@ -75,6 +76,12 @@ class AudioEnvironmentManager:
         self._repo_root = Path(__file__).resolve().parent.parent
         self._scripts_dir = self._repo_root / "scripts"
         self._cleanup_actions: List[Callable[[], None]] = []
+        self._expected_source: Optional[str] = None
+        self._enforce_failures = 0
+        # Serializes enforce_default_source (which may run on an executor
+        # thread) with cleanup(), so a late enforcement can never re-pin the
+        # monitor after the exit-time restore already ran.
+        self._enforce_lock = threading.Lock()
 
     def prepare(self) -> None:
         """Ensure the selected capture mode has a viable device or routing."""
@@ -103,12 +110,16 @@ class AudioEnvironmentManager:
     def cleanup(self) -> None:
         """Rollback any environment changes performed during prepare()."""
 
-        while self._cleanup_actions:
-            action = self._cleanup_actions.pop()
-            try:
-                action()
-            except Exception as exc:  # noqa: BLE001
-                logging.warning("Audio environment cleanup failed: %s", exc)
+        with self._enforce_lock:
+            # Disarm enforcement first so an in-flight or later watchdog tick
+            # cannot undo the restore below.
+            self._expected_source = None
+            while self._cleanup_actions:
+                action = self._cleanup_actions.pop()
+                try:
+                    action()
+                except Exception as exc:  # noqa: BLE001
+                    logging.warning("Audio environment cleanup failed: %s", exc)
 
     def _ensure_device_presence(self) -> None:
         try:
@@ -176,6 +187,7 @@ class AudioEnvironmentManager:
                             f"({source}) is not a monitor. Run "
                             "scripts/setup_audio_loopback_linux.sh or unset the flag."
                         )
+                    self._expected_source = source
                 elif not self._detect_loopback_candidate({"monitor", "loopback"}):
                     raise AudioEnvironmentError(
                         "Loopback auto-setup flag set but no monitor source detected."
@@ -183,9 +195,33 @@ class AudioEnvironmentManager:
             return
 
         if self._config.auto_setup_loopback:
-            capture_defaults = _sanitize_restore_defaults(self._get_linux_defaults())
+            raw_defaults = self._get_linux_defaults()
+            capture_defaults = _sanitize_restore_defaults(raw_defaults)
             if capture_defaults:
                 self._register_linux_defaults_restore(capture_defaults)
+            if raw_defaults is not None:
+                # Any field whose captured value was a codex_transcribe
+                # leftover (unclean earlier exit) has no usable snapshot;
+                # restore that field to the first physical device on exit
+                # instead of leaving it pinned to the virtual routing. This
+                # also covers mixed states, e.g. GNOME re-picked the speakers
+                # but the default source stayed on the monitor.
+                good_sink = capture_defaults[0] if capture_defaults else None
+                good_source = capture_defaults[1] if capture_defaults else None
+                need_sink = raw_defaults[0] is not None and good_sink is None
+                need_source = raw_defaults[1] is not None and good_source is None
+                if need_sink or need_source:
+                    logging.warning(
+                        "Previous session left the virtual sink as a default "
+                        "(sink=%s, source=%s); will restore physical devices on exit.",
+                        raw_defaults[0],
+                        raw_defaults[1],
+                    )
+                    self._cleanup_actions.append(
+                        lambda ns=need_sink, nsrc=need_source: self._restore_physical_defaults(
+                            restore_sink=ns, restore_source=nsrc
+                        )
+                    )
 
             script = self._scripts_dir / "setup_audio_loopback_linux.sh"
             if script.is_file():
@@ -198,6 +234,13 @@ class AudioEnvironmentManager:
                     raise AudioEnvironmentError(
                         "Failed to initialise PipeWire virtual loopback (setup_audio_loopback_linux.sh)."
                     ) from exc
+                # Arm drift enforcement only when capture follows the system
+                # default; a pinned AUDIO_DEVICE_INDEX means deliberate input
+                # changes must not be fought.
+                if self._config.device_index is None:
+                    after = self._get_linux_defaults()
+                    if after and after[1] and after[1].endswith(".monitor"):
+                        self._expected_source = after[1]
             else:
                 logging.debug(
                     "Loopback helper script not found at %s; skipping auto-setup.", script
@@ -220,6 +263,7 @@ class AudioEnvironmentManager:
                 text=True,
                 stderr=subprocess.DEVNULL,
                 env={**os.environ, "LC_ALL": "C"},
+                timeout=5,
             )
         except Exception:  # noqa: BLE001
             return None
@@ -247,6 +291,99 @@ class AudioEnvironmentManager:
                 subprocess.run(["pactl", "set-default-source", source_name], check=False)
 
         self._cleanup_actions.append(restore)
+
+    @staticmethod
+    def _list_pactl_names(kind: str) -> List[str]:
+        try:
+            output = subprocess.check_output(
+                ["pactl", "list", "short", kind],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+        except Exception:  # noqa: BLE001
+            return []
+        names: List[str] = []
+        for line in output.splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 2 and parts[1].strip():
+                names.append(parts[1].strip())
+        return names
+
+    def _restore_physical_defaults(
+        self, restore_sink: bool = True, restore_source: bool = True
+    ) -> None:
+        """Point defaults at the first physical devices for the requested
+        fields (used when the pre-session snapshot for that field was a
+        codex_transcribe leftover from an earlier unclean exit)."""
+
+        sink_choice: Optional[str] = None
+        source_choice: Optional[str] = None
+        if restore_sink:
+            sinks = [
+                n for n in self._list_pactl_names("sinks") if not n.startswith("codex_transcribe")
+            ]
+            sinks.sort(key=lambda n: (0 if n.startswith("alsa_output") else 1))
+            if sinks:
+                sink_choice = sinks[0]
+                subprocess.run(["pactl", "set-default-sink", sink_choice], check=False)
+        if restore_source:
+            sources = [
+                n
+                for n in self._list_pactl_names("sources")
+                if not n.startswith("codex_transcribe") and not n.endswith(".monitor")
+            ]
+            sources.sort(key=lambda n: (0 if n.startswith("alsa_input") else 1))
+            if sources:
+                source_choice = sources[0]
+                subprocess.run(["pactl", "set-default-source", source_choice], check=False)
+        logging.info(
+            "Restored physical audio defaults (sink=%s, source=%s).",
+            sink_choice or "unchanged",
+            source_choice or "unchanged",
+        )
+
+    def enforce_default_source(self) -> bool:
+        """Re-pin the default source to the session's monitor if something
+        (Bluetooth connect, GNOME sound settings, WirePlumber) moved it.
+
+        Returns True when a drift was corrected. Safe to call periodically;
+        serialized against cleanup() so it can never race the exit restore.
+        """
+
+        if self._platform != "linux" or not self._expected_source:
+            return False
+        with self._enforce_lock:
+            expected = self._expected_source
+            if not expected:
+                # cleanup() disarmed enforcement while we waited for the lock.
+                return False
+            try:
+                defaults = self._get_linux_defaults()
+                current = defaults[1] if defaults else None
+                if current == expected:
+                    self._enforce_failures = 0
+                    return False
+                if expected not in self._list_pactl_names("sources"):
+                    # The monitor itself is gone (modules unloaded?); nothing
+                    # safe to enforce.
+                    return False
+                logging.warning(
+                    "Default input drifted to %s during the session; re-pinning %s "
+                    "so meeting audio keeps flowing.",
+                    current,
+                    expected,
+                )
+                subprocess.run(
+                    ["pactl", "set-default-source", expected], check=False, timeout=5
+                )
+                self._enforce_failures = 0
+                return True
+            except Exception as exc:  # noqa: BLE001
+                self._enforce_failures += 1
+                if self._enforce_failures <= 3:
+                    logging.debug("Default-source enforcement check failed: %s", exc)
+                return False
 
     def _prepare_windows_loopback(self) -> None:
         if self._config.auto_setup_loopback:
