@@ -278,3 +278,22 @@ class CaptureLinuxDefaultsTests(unittest.TestCase):
             self.assertEqual(
                 _capture_linux_defaults(), ("alsa_output.analog", "alsa_input.analog")
             )
+
+
+class PackageCheckTests(unittest.TestCase):
+    def test_dotted_module_with_missing_parent_reports_missing_not_crash(self) -> None:
+        """find_spec('google.auth') raises ModuleNotFoundError when 'google'
+        itself is absent; the check must report it as missing."""
+
+        from transcriber import env_check
+
+        with mock.patch.dict(
+            env_check.REQUIRED_PACKAGES, {"google-auth": "google.auth"}, clear=True
+        ), mock.patch(
+            "transcriber.env_check.importlib.util.find_spec",
+            side_effect=ModuleNotFoundError("No module named 'google'"),
+        ):
+            installed, missing = env_check._check_packages()
+
+        self.assertEqual(installed, [])
+        self.assertEqual(missing, ["google-auth"])

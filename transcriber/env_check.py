@@ -44,14 +44,24 @@ def _print_section(title: str) -> None:
     print("=" * 60)
 
 
+def _module_available(module_name: str) -> bool:
+    try:
+        return importlib.util.find_spec(module_name) is not None
+    except (ImportError, ValueError):
+        # find_spec on a dotted name (e.g. "google.auth") raises
+        # ModuleNotFoundError when the parent package itself is absent —
+        # that means "missing", not a crash.
+        return False
+
+
 def _check_packages() -> Tuple[List[str], List[str]]:
     missing: List[str] = []
     installed: List[str] = []
     for pretty, module_name in REQUIRED_PACKAGES.items():
-        if importlib.util.find_spec(module_name) is None:
-            missing.append(pretty)
-        else:
+        if _module_available(module_name):
             installed.append(pretty)
+        else:
+            missing.append(pretty)
     return installed, missing
 
 
@@ -269,6 +279,13 @@ def run_environment_check() -> bool:
     print(f"Platform : {platform.platform()}")
     print(f"Python   : {sys.version}")
     print(f"Executable: {sys.executable}")
+    if sys.prefix == getattr(sys, "base_prefix", sys.prefix):
+        print(
+            "  [!!] 仮想環境の外で実行されています。依存関係が見つからない場合は、\n"
+            "       .venv311 のあるコピー（例: ~/ミュージック 配下）で実行するか、\n"
+            "       `python3 -m venv .venv311 && .venv311/bin/pip install -r requirements.txt` "
+            "で環境を作成してください。"
+        )
     python_issues = _check_python_version()
     if python_issues:
         for issue in python_issues:
